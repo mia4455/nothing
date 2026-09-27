@@ -35,7 +35,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from pro_quant import position_size, snapshot as professional_snapshot
 from pro_features import TTLCache, data_quality, event_fingerprint, explainable_score, retest_state
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -59,6 +59,8 @@ BKASH_NUMBER = os.getenv("BKASH_NUMBER", "").strip()
 NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "").strip()
 PRO_30_PRICE = os.getenv("PRO_30_PRICE", "Contact admin").strip()
 PRO_90_PRICE = os.getenv("PRO_90_PRICE", "Contact admin").strip()
+ADMIN_CONTACT_NAME = os.getenv("ADMIN_CONTACT_NAME", "—͞Tᴍ Mᴜsᴀ").strip()
+ADMIN_CONTACT_USERNAME = os.getenv("ADMIN_CONTACT_USERNAME", "tmmusa73").strip().lstrip("@")
 SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
 
 SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Return clear Bengali analysis. Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
@@ -307,6 +309,7 @@ class AnalystBot:
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_mode TEXT NOT NULL DEFAULT 'balanced'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Dhaka'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'bn'")
+            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notified BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS event_filter TEXT NOT NULL DEFAULT 'all'")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_candle TEXT")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_fingerprint TEXT")
@@ -323,6 +326,24 @@ class AnalystBot:
         row=await self.db.fetchrow("SELECT plan,plan_until FROM users WHERE telegram_id=$1",user_id)
         if row and row["plan"]=="pro" and row["plan_until"] and row["plan_until"]>datetime.now(timezone.utc): return "pro"
         return "free"
+
+    async def has_access(self, user_id: int | None) -> bool:
+        return await self.effective_plan(user_id) in {"pro", "admin"}
+
+    async def notify_new_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Notify admins once when an unapproved user first opens/uses the bot."""
+        if not self.db or not update.effective_user or update.effective_user.id in ADMIN_IDS: return
+        await self.ensure_user(update)
+        row=await self.db.fetchrow("SELECT admin_notified FROM users WHERE telegram_id=$1",update.effective_user.id)
+        if row and row["admin_notified"]: return
+        u=update.effective_user
+        text=(f"নতুন user bot access চেয়েছে\n\nName: {u.full_name}\nUsername: @{u.username or 'none'}\nUser ID: {u.id}\n"
+              f"Approve 30 days: /approve {u.id} 30")
+        delivered=False
+        for admin_id in ADMIN_IDS:
+            try: await context.bot.send_message(admin_id,text); delivered=True
+            except Exception: log.warning("Could not notify admin %s",admin_id)
+        if delivered: await self.db.execute("UPDATE users SET admin_notified=TRUE WHERE telegram_id=$1",u.id)
 
     async def user_settings(self, user_id: int | None) -> dict[str,str]:
         defaults={"detail_mode":"standard","risk_mode":"balanced","timezone":"Asia/Dhaka","language":"bn"}
@@ -599,9 +620,12 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
 BOT: AnalystBot | None = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
+    assert BOT is not None
+    await BOT.ensure_user(update)
+    if not await BOT.has_access(update.effective_user.id):
+        await deny_unapproved(update,context); return
     await update.effective_message.reply_text(
-        "👋 <b>Crypto Technical Analyst</b>\n\nCoin ও timeframe পাঠান—যেমন <code>BTC</code>, <code>SUIUSDT 4H</code>, অথবা বাংলা/ইংরেজি voice note। Timeframe না দিলে 4H।\n\n⚠️ এটি শিক্ষামূলক বিশ্লেষণ, আর্থিক পরামর্শ নয়।",
+        "👋 <b>Crypto Technical Analyst</b>\n\nCoin ও timeframe পাঠান—যেমন <code>BTC</code>, <code>SUIUSDT 4H</code>, অথবা বাংলা/ইংরেজি voice note। Timeframe না দিলে 4H।\n\nসম্পূর্ণ ব্যবহারবিধি: /guide\n⚠️ এটি শিক্ষামূলক বিশ্লেষণ, আর্থিক পরামর্শ নয়।",
         parse_mode=ParseMode.HTML,
     )
 
@@ -610,16 +634,83 @@ def plan_text(plan: str) -> str:
     return title+"\n\n"+"\n".join(f"• {x}" for x in PLAN_FEATURES[plan])
 
 
+def contact_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(f"Admin: {ADMIN_CONTACT_NAME}", url=f"https://t.me/{ADMIN_CONTACT_USERNAME}")
+
+
 def subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Pro — 30 দিন",callback_data="sub|pro30"),InlineKeyboardButton("Pro — 90 দিন",callback_data="sub|pro90")],
+        [InlineKeyboardButton(f"Pro 30 দিন — {PRO_30_PRICE}",callback_data="sub|pro30")],
+        [InlineKeyboardButton(f"Pro 90 দিন — {PRO_90_PRICE}",callback_data="sub|pro90")],
+        [contact_button()],
         [InlineKeyboardButton("আমার বর্তমান Plan",callback_data="myplan")],
     ])
+
+
+def guide_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Coin Analysis",callback_data="guide|analysis"),InlineKeyboardButton("Breakout Alerts",callback_data="guide|alerts")],
+        [InlineKeyboardButton("Charts ও Buttons",callback_data="guide|charts"),InlineKeyboardButton("Scanner ও Backtest",callback_data="guide|research")],
+        [InlineKeyboardButton("Risk Tools",callback_data="guide|risk"),InlineKeyboardButton("Settings",callback_data="guide|settings")],
+        [InlineKeyboardButton("Subscription",callback_data="subscriptions")],
+    ])
+
+
+def guide_submenu(section: str) -> InlineKeyboardMarkup:
+    items={
+      "analysis":[("Text analysis","text"),("Voice analysis","voice"),("Timeframes","timeframes"),("Report modes","reports")],
+      "alerts":[("Create alert","create_alert"),("Alert types","alert_types"),("Manage alerts","manage_alerts"),("Retest alerts","retest_alerts")],
+      "charts":[("Refresh","refresh"),("1H / 4H / 1D","chart_tf"),("History","history"),("Settings button","chart_settings")],
+      "research":[("Market scanner","scanner"),("Backtest","backtest"),("History scan","history_scan"),("Data quality","quality")],
+      "risk":[("Position size","position"),("Confirmation modes","confirmation"),("Risk warning","risk_warning"),("Setup score","score")],
+      "settings":[("Quick report","quick"),("Professional report","professional"),("Timezone","timezone"),("Language","language")],
+    }
+    rows=[[InlineKeyboardButton(label,callback_data=f"gitem|{key}")] for label,key in items.get(section,[])]
+    rows.append([InlineKeyboardButton("← মূল Guide",callback_data="guidehome")])
+    return InlineKeyboardMarkup(rows)
+
+
+GUIDE_DETAILS={
+ "text":"Coin ও timeframe লিখুন: SUIUSDT 4H, BTC 1H, অথবা বাংলা প্রশ্ন। Timeframe না দিলে 4H। Bot closed candle, indicators, breakout, news ও futures context বিশ্লেষণ করে chart এবং বিস্তারিত report পাঠাবে।",
+ "voice":"বাংলা বা English voice note পাঠান। Bot audio শুনে coin ও timeframe বের করবে। পরিষ্কারভাবে coin-এর ticker বলুন। Voice file 20 MB-এর কম রাখুন।",
+ "timeframes":"সমর্থিত: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w। Short timeframe বেশি noisy; 4H/1D তুলনামূলক স্থিতিশীল।",
+ "reports":"Quick সংক্ষিপ্ত ফলাফল, Standard ব্যাখ্যাসহ analysis, Professional-এ advanced structure, liquidity, futures, news ও multi-timeframe context থাকে।",
+ "create_alert":"উদাহরণ: /alert SUI 4h confirmed। Bot background-এ fully closed candle monitor করবে। /alert SUI 4h all দিলে সব গুরুত্বপূর্ণ state দেখবে।",
+ "alert_types":"all, approaching, confirmed, retest, false, volume। Confirmed মানে close+volume+body confirmation; retest মানে breakout level পুনরায় পরীক্ষা।",
+ "manage_alerts":"/alerts দিয়ে তালিকা দেখুন। /delete_alert ID দিয়ে বন্ধ করুন। একই candle/event fingerprint পুনরায় notification দেয় না।",
+ "retest_alerts":"/alert SUI 4h retest। Breakout-এর পর WAITING_FOR_RETEST, RETEST_HELD বা RETEST_FAILED event monitor হবে।",
+ "refresh":"Chart-এর Refresh button একই coin/timeframe-এর সর্বশেষ closed data দিয়ে analysis আবার চালায়।",
+ "chart_tf":"1H, 4H ও 1D button একই coin-কে অন্য timeframe-এ সঙ্গে সঙ্গে বিশ্লেষণ করে।",
+ "history":"Chart-এর History button সাম্প্রতিক confirmed/false breakout events ও levels দেখায়।",
+ "chart_settings":"Settings button থেকে report detail, Aggressive/Balanced/Conservative confirmation এবং language নির্বাচন করুন।",
+ "scanner":"/scanner 4h top-volume USDT markets scan করে সম্ভাব্য breakout candidates rank করে। Score probability নয়।",
+ "backtest":"/backtest BTC 4h historical rules test করে। ফল ভবিষ্যৎ লাভের নিশ্চয়তা নয় এবং fees/slippage assumptions পড়তে হবে।",
+ "history_scan":"/history SUI 4h আগের breakout, breakdown, volume ও follow-through দেখায়।",
+ "quality":"Data-quality score spot candles, higher timeframe, futures, news এবং BTC/ETH filter availability দেখায়। Missing source অনুমান করা হয় না।",
+ "position":"/risk ENTRY STOP CAPITAL RISK_PERCENT। উদাহরণ: /risk 65000 63000 1000 1। Maximum risk, units ও position value হিসাব হবে।",
+ "confirmation":"Aggressive দ্রুত কিন্তু noisy; Balanced default; Conservative বেশি volume/body এবং higher-timeframe alignment চায়।",
+ "risk_warning":"Bot কোনো order দেয় না, fund access করে না এবং নিশ্চিত prediction দেয় না। প্রতিটি setup conditional educational analysis।",
+ "score":"Setup score technical conditions-এর strength; এটি breakout হওয়ার শতকরা probability নয়। Component conflicts-ও পরীক্ষা করা হয়।",
+ "quick":"সংক্ষিপ্ত state, triggers, structure, RSI, volume ও score। দ্রুত ব্যবহারের জন্য।",
+ "professional":"Advanced indicators, BOS/CHoCH, liquidity sweep, FVG, order block, volume profile, futures/news ও market filter।",
+ "timezone":"/timezone Asia/Dhaka। Valid IANA timezone দিলে user setting database-এ save হবে।",
+ "language":"Settings থেকে বাংলা বা English নির্বাচন করা যায়। Technical labels পরিচিত English terms-এ থাকতে পারে।",
+}
+
+
+async def deny_unapproved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    await BOT.notify_new_user(update,context)
+    text=("এই bot ব্যবহার করতে অনুমোদিত subscription প্রয়োজন।\n\nPlan নির্বাচন করলে মূল্য ও সব সুবিধা দেখতে পারবেন। Payment/approval-এর জন্য নিচের Admin button চাপুন।")
+    await update.effective_message.reply_text(text,reply_markup=subscription_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context; assert BOT is not None
     await BOT.ensure_user(update); plan=await BOT.effective_plan(update.effective_user.id)
+    if plan=="free":
+        await BOT.notify_new_user(update,context)
+        await update.effective_message.reply_text("আপনার account এখনো অনুমোদিত নয়। Package, মূল্য ও সুবিধা দেখতে নিচের option ব্যবহার করুন।",reply_markup=subscription_keyboard()); return
     common=("কীভাবে ব্যবহার করবেন\n\nCoin analysis: BTC 4H অথবা বাংলা/English voice note\n"
             "/history SUI 4h — আগের breakout events\n/risk 65000 63000 1000 1 — position size\n"
             "/alert SUI 4h confirmed — smart alert\n/alerts — active alerts\n/watchlist SUI — watchlist\n"
@@ -628,6 +719,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if plan in {"pro","admin"}: extra="\n/scanner 4h — top market candidates\n/backtest BTC 4h — research backtest\nProfessional report mode ব্যবহার করতে পারবেন।"
     if plan=="admin": extra += "\n/stats — system statistics\n/health — system health\n/approve USER_ID DAYS — subscription approve"
     await send_long(update.effective_message,common+extra+"\n\n"+plan_text(plan))
+
+
+async def guide_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    await BOT.ensure_user(update)
+    plan=await BOT.effective_plan(update.effective_user.id)
+    await update.effective_message.reply_text(f"Interactive Guide\nবর্তমান access: {plan.upper()}\n\nযে বিষয় জানতে চান সেটি নির্বাচন করুন:",reply_markup=guide_keyboard())
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -742,8 +840,15 @@ async def run_request(update: Update, request: Request) -> None:
             # Matplotlib is CPU-bound and not thread-safe; render promptly in event thread.
             image = BOT.chart(frame, request, result)
         bo = result["quant"]["breakout"]
-        caption = (f"📊 {request.symbol} • {request.timeframe}\nশেষ মূল্য: {frame.Close.iloc[-1]:.10g} USDT\n"
-                   f"অবস্থা: {bo['state']}\nBull trigger: {bo['bullish_trigger']:.8g} | Bear trigger: {bo['bearish_trigger']:.8g}")
+        state_bn={"INSIDE_RANGE":"রেঞ্জের ভেতরে","APPROACHING_BREAKOUT":"ব্রেকআউটের কাছাকাছি",
+                  "APPROACHING_BREAKDOWN":"ব্রেকডাউনের কাছাকাছি","BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত",
+                  "BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত","FALSE_BREAKOUT_RISK":"ফলস ব্রেকআউটের ঝুঁকি",
+                  "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউনের ঝুঁকি"}.get(bo['state'],bo['state'].replace('_',' ').title())
+        caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
+                   f"শেষ বন্ধ মূল্য: {frame.Close.iloc[-1]:.10g} USDT\n"
+                   f"বর্তমান অবস্থা: {state_bn}\n"
+                   f"উপরের ট্রিগার: {bo['bullish_trigger']:.8g}\nনিচের ট্রিগার: {bo['bearish_trigger']:.8g}\n"
+                   f"সম্পূর্ণ ব্যাখ্যা নিচের বার্তায় দেওয়া হয়েছে।")
         await message.reply_photo(photo=image, caption=caption, reply_markup=analysis_keyboard(request.symbol, request.timeframe))
         prefix = f"🎙️ শুনেছি: {request.transcript}\n\n" if request.transcript and message.voice else ""
         await send_long(message, prefix + result["analysis_bn"])
@@ -800,7 +905,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     assert BOT is not None
     q=update.callback_query; await q.answer(); data=q.data or ""
     parts=data.split("|")
+    public_callback=data in {"myplan","subscriptions","guidehome"} or parts[0] in {"sub","subreq","guide","gitem"}
+    if not public_callback and not await BOT.has_access(update.effective_user.id):
+        await deny_unapproved(update,context); return
     try:
+        if data=="guidehome":
+            await q.message.reply_text("Interactive Guide — একটি বিভাগ নির্বাচন করুন:",reply_markup=guide_keyboard()); return
+        if parts[0]=="guide" and len(parts)==2:
+            await q.message.reply_text("এই বিভাগের একটি বিষয় নির্বাচন করুন:",reply_markup=guide_submenu(parts[1])); return
+        if parts[0]=="gitem" and len(parts)==2:
+            detail=GUIDE_DETAILS.get(parts[1],"Guide পাওয়া যায়নি।")
+            await q.message.reply_text(detail,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← মূল Guide",callback_data="guidehome")]])); return
         if parts[0]=="an" and len(parts)==3:
             await run_request(update,Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]))); return
         if parts[0]=="al" and len(parts)==3:
@@ -827,7 +942,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if NAGAD_NUMBER: payment.append(f"Nagad: {NAGAD_NUMBER}")
             pay="\n".join(payment) or "Payment number জানতে admin-এর সঙ্গে যোগাযোগ করুন।"
             text=f"Pro Subscription — {days} দিন\nমূল্য: {price}\n\n{plan_text('pro')}\n\nPayment\n{pay}\n\nPayment সম্পন্ন করে নিচের Request Approval button চাপুন। Transaction ID পরে admin-কে পাঠাতে পারেন।"
-            kb=InlineKeyboardMarkup([[InlineKeyboardButton("Request Approval",callback_data=f"subreq|{code}")],[InlineKeyboardButton("Back",callback_data="subscriptions")]])
+            kb=InlineKeyboardMarkup([[InlineKeyboardButton("Request Approval",callback_data=f"subreq|{code}")],[contact_button()],[InlineKeyboardButton("← Packages",callback_data="subscriptions")]])
             await q.message.reply_text(text,reply_markup=kb); return
         if data=="subscriptions":
             await q.message.reply_text("Subscription plan নির্বাচন করুন:",reply_markup=subscription_keyboard()); return
@@ -854,7 +969,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await q.message.reply_text("Professional report Pro feature। বিস্তারিত জানতে /subscribe পাঠান।"); return
             await BOT.ensure_user(update)
             await BOT.db.execute(f"UPDATE users SET {field}=$1 WHERE telegram_id=$2",value,update.effective_user.id)
-            await q.message.reply_text(f"✅ {field}: {value}"); return
+            field_bn={"detail_mode":"Report mode","risk_mode":"Confirmation mode","language":"Language"}.get(field,field)
+            await q.message.reply_text(f"✅ {field_bn} পরিবর্তন হয়েছে: {value.title()}"); return
     except UserInputError as exc: await q.message.reply_text(f"⚠️ {exc}")
     except Exception: log.exception("Callback failed"); await q.message.reply_text("এই action সম্পন্ন করা যায়নি।")
 
@@ -1048,6 +1164,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     if BOT: await BOT.init_db()
+    commands=[
+        BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive ব্যবহার নির্দেশিকা"),
+        BotCommand("subscribe","Packages ও approval"),BotCommand("settings","Report ও confirmation settings"),
+        BotCommand("alert","Breakout monitoring"),BotCommand("alerts","Active alerts"),
+        BotCommand("scanner","Market scanner"),BotCommand("history","Breakout history"),
+        BotCommand("backtest","Strategy backtest"),BotCommand("risk","Position-size calculator"),
+        BotCommand("watchlist","Watchlist"),BotCommand("health","System health"),
+    ]
+    await application.bot.set_my_commands(commands)
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     if application.job_queue:
         application.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=20, name="breakout-alert-monitor")
 
@@ -1055,6 +1181,15 @@ async def post_shutdown(application: Application) -> None:
     del application
     if BOT:
         await BOT.close()
+
+
+def protected(handler: Any) -> Any:
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        assert BOT is not None
+        if not await BOT.has_access(update.effective_user.id if update.effective_user else None):
+            await deny_unapproved(update,context); return
+        await handler(update,context)
+    return wrapper
 
 
 def main() -> None:
@@ -1066,24 +1201,24 @@ def main() -> None:
            .connect_timeout(20).read_timeout(60).write_timeout(60).post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("guide", help_command))
+    app.add_handler(CommandHandler("guide", guide_command))
     app.add_handler(CommandHandler("subscribe", subscribe_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("risk", risk_command))
-    app.add_handler(CommandHandler("backtest", backtest_command))
-    app.add_handler(CommandHandler("scanner", scanner_command))
-    app.add_handler(CommandHandler("timezone", timezone_command))
-    app.add_handler(CommandHandler("health", health_command))
-    app.add_handler(CommandHandler("alert", alert_command))
-    app.add_handler(CommandHandler("alerts", alerts_command))
-    app.add_handler(CommandHandler("delete_alert", delete_alert_command))
-    app.add_handler(CommandHandler("watchlist", watchlist_command))
+    app.add_handler(CommandHandler("settings", protected(settings_command)))
+    app.add_handler(CommandHandler("history", protected(history_command)))
+    app.add_handler(CommandHandler("risk", protected(risk_command)))
+    app.add_handler(CommandHandler("backtest", protected(backtest_command)))
+    app.add_handler(CommandHandler("scanner", protected(scanner_command)))
+    app.add_handler(CommandHandler("timezone", protected(timezone_command)))
+    app.add_handler(CommandHandler("health", protected(health_command)))
+    app.add_handler(CommandHandler("alert", protected(alert_command)))
+    app.add_handler(CommandHandler("alerts", protected(alerts_command)))
+    app.add_handler(CommandHandler("delete_alert", protected(delete_alert_command)))
+    app.add_handler(CommandHandler("watchlist", protected(watchlist_command)))
     app.add_handler(CommandHandler("stats", admin_stats_command))
     app.add_handler(CommandHandler("approve", approve_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.VOICE, protected(voice_handler)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, protected(text_handler)))
     app.add_error_handler(error_handler)
     log.info("Starting bot with model=%s candles=%d", MODEL_NAME, CANDLE_LIMIT)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False, stop_signals=(signal.SIGINT, signal.SIGTERM))
