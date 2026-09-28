@@ -433,7 +433,10 @@ class AnalystBot:
             response_schema=schema,
             temperature=0.15,
         )
-        for attempt in range(3):
+        # High-demand 503/429 responses are temporary. Retry with progressively
+        # longer waits before allowing the deterministic Python fallback to run.
+        retry_delays=(2,5,10,20)
+        for attempt in range(5):
             try:
                 response = await self.gemini.aio.models.generate_content(
                     model=MODEL_NAME, contents=contents, config=config
@@ -445,19 +448,30 @@ class AnalystBot:
                 raise
             except Exception as exc:
                 msg = str(exc).lower()
-                transient = any(x in msg for x in ("429", "quota", "resource exhausted", "503", "unavailable", "timeout"))
-                if not transient or attempt == 2:
-                    log.exception("Gemini request failed model=%s", MODEL_NAME)
-                    if any(x in msg for x in ("404", "not found", "not supported", "model")):
-                        friendly=f"Gemini model '{MODEL_NAME}' এই API project/SDK-তে পাওয়া যায়নি। Railway-এর GEMINI_MODEL এবং deployment logs পরীক্ষা করুন।"
-                    elif any(x in msg for x in ("401", "403", "api key", "permission", "unauthenticated")):
-                        friendly="Gemini API key invalid, restricted অথবা এই project-এর permission নেই। Railway-এর GEMINI_API_KEY পরীক্ষা করুন।"
-                    elif any(x in msg for x in ("429", "quota", "resource exhausted")):
-                        friendly="Gemini free quota/rate limit শেষ হয়েছে। কিছুক্ষণ পরে চেষ্টা করুন অথবা Google AI Studio quota পরীক্ষা করুন।"
-                    else:
-                        friendly="Gemini request ব্যর্থ হয়েছে। Railway runtime log-এ আসল Google error দেখা যাবে।"
-                    raise UserInputError(friendly) from exc
-                await asyncio.sleep(2 ** attempt)
+                overloaded=any(x in msg for x in ("503", "unavailable", "high demand", "overloaded"))
+                rate_limited=any(x in msg for x in ("429", "quota", "resource exhausted", "rate limit"))
+                timed_out=any(x in msg for x in ("timeout", "timed out", "deadline exceeded"))
+                transient=overloaded or rate_limited or timed_out
+                if transient and attempt < len(retry_delays):
+                    delay=retry_delays[attempt]
+                    log.warning("Temporary Gemini failure; retrying in %ss (attempt %s/5): %s",delay,attempt+1,exc)
+                    await asyncio.sleep(delay)
+                    continue
+
+                log.exception("Gemini request failed model=%s", MODEL_NAME)
+                # Check concrete status/auth conditions before generic words such as
+                # 'model': Google's 503 text says 'This model is ... high demand'.
+                if overloaded:
+                    friendly="Gemini বর্তমানে অতিরিক্ত ব্যস্ত। স্বয়ংক্রিয় Python fallback analysis ব্যবহার করা হচ্ছে। পরে আবার চেষ্টা করুন।"
+                elif rate_limited:
+                    friendly="Gemini free quota/rate limit শেষ হয়েছে। স্বয়ংক্রিয় Python fallback analysis ব্যবহার করা হচ্ছে।"
+                elif any(x in msg for x in ("401", "403", "api key", "permission", "unauthenticated")):
+                    friendly="Gemini API key invalid, restricted অথবা এই project-এর permission নেই। Railway-এর GEMINI_API_KEY পরীক্ষা করুন।"
+                elif any(x in msg for x in ("404", "not found", "not supported")):
+                    friendly=f"Gemini model '{MODEL_NAME}' এই API project/SDK-তে পাওয়া যায়নি। Railway-এর GEMINI_MODEL পরীক্ষা করুন।"
+                else:
+                    friendly="Gemini request ব্যর্থ হয়েছে। স্বয়ংক্রিয় Python fallback analysis ব্যবহার করা হচ্ছে।"
+                raise UserInputError(friendly) from exc
         raise AssertionError("unreachable")
 
     @staticmethod
