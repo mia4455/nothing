@@ -911,8 +911,8 @@ def analysis_keyboard(symbol: str, timeframe: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("1H", callback_data=f"an|{base}|1h"),
          InlineKeyboardButton("4H", callback_data=f"an|{base}|4h"),
          InlineKeyboardButton("1D", callback_data=f"an|{base}|1d")],
-        [InlineKeyboardButton("📈 Open TradingView",url=tradingview_url(symbol,timeframe)),
-         InlineKeyboardButton("📋 Pine Script",callback_data=f"pine|{base}|{timeframe}")],
+        [InlineKeyboardButton("📈 TradingView",url=tradingview_url(symbol,timeframe)),
+         InlineKeyboardButton("📋 Script",callback_data=f"pine|{base}|{timeframe}")],
         [InlineKeyboardButton("Set Alert", callback_data=f"al|{base}|{timeframe}"),
          InlineKeyboardButton("History", callback_data=f"hi|{base}|{timeframe}"),
          InlineKeyboardButton("Settings", callback_data="settings")],
@@ -983,7 +983,9 @@ def make_pine_script(symbol: str,timeframe: str,frame: pd.DataFrame,result: dict
             ta=int(frame.index[a].timestamp()*1000); tb=int(frame.index[b].timestamp()*1000)
             lines += [f'var line tl{i}=line.new({ta},{n(t["start_val"])},{tb},{n(t["end_val"])},xloc=xloc.bar_time,extend=extend.right,color=color.blue,width=2,style=line.style_dashed)']
     labels=" + ".join([f'"S{i} " + str.tostring(s{i}) + "\\n"' for i in range(1,4)]+[f'"R{i} " + str.tostring(r{i}) + "\\n"' for i in range(1,4)])+' + "Bull " + str.tostring(bull) + "\\nBear " + str.tostring(bear)'
-    lines += ["var label info=na","if barstate.islast","    label.delete(info)",f'    info:=label.new(bar_index,high,{labels},style=label.style_label_down,color=color.new(color.black,15),textcolor=color.white)']
+    # Put the information box 18 bars into the future, away from live candles.
+    # TradingView reserves right-side space for this label automatically.
+    lines += ["var label info=na","if barstate.islast","    label.delete(info)",f'    info:=label.new(bar_index+18,close,{labels},xloc=xloc.bar_index,style=label.style_label_left,color=color.new(color.black,15),textcolor=color.white,size=size.small)']
     return "\n".join(lines)+"\n"
 
 
@@ -1198,13 +1200,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     script=make_pine_script(symbol,tf,frame,rebuilt); BOT.cache.set(key,script,86400)
             if not script: await q.message.reply_text("Pine Script পাওয়া যায়নি। আগে coin-টির নতুন analysis নিন।"); return
             buf=io.BytesIO(script.encode()); buf.name=f"Crypto_AI_{symbol.replace('/','')}_{tf}.pine"
-            await q.message.reply_document(document=buf,caption="TradingView Pine Script\n\n1. Open TradingView button চাপুন\n2. Pine Editor খুলুন\n3. এই file-এর code paste করুন\n4. Add to chart চাপুন")
-            escaped=html.escape(script)
-            if len(escaped)+40<=4096:
-                await q.message.reply_text(f"<pre>{escaped}</pre>",parse_mode=ParseMode.HTML)
-            else:
-                await q.message.reply_text("Script Telegram message limit-এর চেয়ে বড়; উপরের .pine file খুলে Select All → Copy করুন।")
+            await q.message.reply_document(document=buf,caption="TradingView Script\n\n1. TradingView button চাপুন\n2. Pine Editor খুলুন\n3. এই file-এর code paste করুন\n4. Add to chart চাপুন")
+            preview=(f"Script ready — {symbol.replace('/','')} {tf.upper()}\n\n"
+                     "নিচের Show Script button চাপলে সম্পূর্ণ code দেখা যাবে। Hide Script চাপলে আবার ছোট হয়ে যাবে।\n"
+                     "সবচেয়ে সহজ উপায়: .pine file খুলে Select All → Copy।")
+            await q.message.reply_text(preview,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Show Script",callback_data=f"pshow|{parts[1]}|{tf}")]]))
             return
+        if parts[0]=="pshow" and len(parts)==3:
+            symbol=BOT._normalize_symbol(parts[1]); tf=BOT._normalize_tf(parts[2]); key=f"pine:{update.effective_user.id}:{symbol}:{tf}"; script=BOT.cache.get(key)
+            if not script: await q.message.reply_text("Script cache শেষ হয়েছে। Chart-এর Script button আবার চাপুন।"); return
+            escaped=html.escape(script)
+            if len(escaped)+40>4096: await q.message.reply_text("Script message limit-এর চেয়ে বড়। .pine file ব্যবহার করুন।"); return
+            await q.edit_message_text(f"<pre>{escaped}</pre>",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Hide Script",callback_data=f"phide|{parts[1]}|{tf}")]])); return
+        if parts[0]=="phide" and len(parts)==3:
+            symbol=BOT._normalize_symbol(parts[1]); tf=BOT._normalize_tf(parts[2])
+            preview=f"Script ready — {symbol.replace('/','')} {tf.upper()}\n\nShow Script চাপলে সম্পূর্ণ code দেখা যাবে। .pine file থেকেও code copy করতে পারবেন।"
+            await q.edit_message_text(preview,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Show Script",callback_data=f"pshow|{parts[1]}|{tf}")]])); return
         if parts[0]=="evrem" and len(parts)==2 and parts[1].isdigit():
             if not BOT.db: await q.message.reply_text("DATABASE_URL সেট করা নেই।"); return
             eid=int(parts[1]); event=await BOT.db.fetchrow("SELECT * FROM market_events WHERE id=$1 AND active AND starts_at>NOW()",eid)
