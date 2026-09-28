@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -289,6 +290,7 @@ class AnalystBot:
         self.db: asyncpg.Pool | None = None
         self.cache = TTLCache(maxsize=512)
         self.last_alert_scan: datetime | None = None
+        self.usage_windows: dict[tuple[int,str],deque[float]] = defaultdict(deque)
 
     async def init_db(self) -> None:
         if not DATABASE_URL:
@@ -328,6 +330,20 @@ class AnalystBot:
                   volume_ratio DOUBLE PRECISION, body_strength DOUBLE PRECISION,
                   created_at TIMESTAMPTZ DEFAULT NOW(),
                   UNIQUE(symbol,timeframe,candle_open,event_type));
+                CREATE TABLE IF NOT EXISTS market_events(
+                  id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, starts_at TIMESTAMPTZ NOT NULL,
+                  impact TEXT NOT NULL DEFAULT 'medium', title TEXT NOT NULL, source_url TEXT,
+                  created_by BIGINT, active BOOLEAN NOT NULL DEFAULT TRUE,
+                  created_at TIMESTAMPTZ DEFAULT NOW());
+                CREATE TABLE IF NOT EXISTS event_reminders(
+                  telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                  event_id BIGINT REFERENCES market_events(id) ON DELETE CASCADE,
+                  chat_id BIGINT NOT NULL, sent_24h BOOLEAN DEFAULT FALSE, sent_1h BOOLEAN DEFAULT FALSE,
+                  sent_10m BOOLEAN DEFAULT FALSE, active BOOLEAN DEFAULT TRUE,
+                  created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(telegram_id,event_id));
+                CREATE TABLE IF NOT EXISTS admin_audit_log(
+                  id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
+                  target_user_id BIGINT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
             """)
             # Idempotent lightweight migrations for the compact deployment.
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS detail_mode TEXT NOT NULL DEFAULT 'standard'")
@@ -336,6 +352,8 @@ class AnalystBot:
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'bn'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notified BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry_3d_sent BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry_1d_sent BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS event_filter TEXT NOT NULL DEFAULT 'all'")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_candle TEXT")
             await con.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_fingerprint TEXT")
@@ -357,6 +375,14 @@ class AnalystBot:
     async def has_access(self, user_id: int | None) -> bool:
         return await self.effective_plan(user_id) in {"pro", "admin"}
 
+    async def allow_request(self,user_id:int,action:str) -> tuple[bool,int]:
+        if user_id in ADMIN_IDS: return True,0
+        limits={"analysis":(10,60),"scanner":(2,600),"voice":(5,3600)}
+        maximum,window=limits.get(action,(30,60)); now=time.monotonic(); q=self.usage_windows[(user_id,action)]
+        while q and q[0]<=now-window: q.popleft()
+        if len(q)>=maximum: return False,max(1,int(window-(now-q[0])))
+        q.append(now); return True,0
+
     async def notify_new_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Notify admins once when an unapproved user first opens/uses the bot."""
         if not self.db or not update.effective_user or update.effective_user.id in ADMIN_IDS: return
@@ -367,7 +393,7 @@ class AnalystBot:
         command=f"/approve {u.id} 30"
         text=(f"নতুন user bot access চেয়েছে\n\nName: {html.escape(u.full_name)}\nUsername: @{html.escape(u.username or 'none')}\nUser ID: <code>{u.id}</code>\n"
               f"Approve 30 days:\n<code>{command}</code>\n\nউপরের mono command-এ tap/hold করে copy করুন।")
-        copy_kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy approve command",copy_text=CopyTextButton(command))]])
+        copy_kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(u.id))),InlineKeyboardButton("📋 Copy approve command",copy_text=CopyTextButton(command))]])
         delivered=False
         for admin_id in ADMIN_IDS:
             try: await context.bot.send_message(admin_id,text,parse_mode=ParseMode.HTML,reply_markup=copy_kb); delivered=True
@@ -751,7 +777,7 @@ def guide_submenu(section: str) -> InlineKeyboardMarkup:
       "analysis":[("Text analysis","text"),("Voice analysis","voice"),("Timeframes","timeframes"),("Report modes","reports")],
       "alerts":[("Create alert","create_alert"),("Alert types","alert_types"),("Manage alerts","manage_alerts"),("Retest alerts","retest_alerts")],
       "charts":[("Refresh","refresh"),("1H / 4H / 1D","chart_tf"),("History","history"),("Settings button","chart_settings")],
-      "research":[("Market scanner","scanner"),("Backtest","backtest"),("History scan","history_scan"),("Data quality","quality")],
+      "research":[("Market scanner","scanner"),("News ও events","events_help"),("Backtest","backtest"),("History scan","history_scan"),("Data quality","quality")],
       "risk":[("Position size","position"),("Confirmation modes","confirmation"),("Risk warning","risk_warning"),("Setup score","score")],
       "settings":[("Quick report","quick"),("Professional report","professional"),("Timezone","timezone"),("Language","language")],
     }
@@ -774,6 +800,7 @@ GUIDE_DETAILS={
  "history":"Chart-এর History button সাম্প্রতিক confirmed/false breakout events ও levels দেখায়।",
  "chart_settings":"Settings button থেকে report detail, Aggressive/Balanced/Conservative confirmation এবং language নির্বাচন করুন।",
  "scanner":"/scanner 4h top-volume USDT markets scan করে সম্ভাব্য breakout candidates rank করে। Score probability নয়।",
+ "events_help":"/events BTC দিলে BTC-এর upcoming scheduled events এবং fresh RSS news দেখাবে। /events all পুরো market context দেখায়। Admin /event_add BTC 2026-09-29T06:00:00+06:00 high Event title দিয়ে সময়-নির্ধারিত event যোগ করতে পারেন।",
  "backtest":"/backtest BTC 4h historical rules test করে। ফল ভবিষ্যৎ লাভের নিশ্চয়তা নয় এবং fees/slippage assumptions পড়তে হবে।",
  "history_scan":"/history SUI 4h আগের breakout, breakdown, volume ও follow-through দেখায়।",
  "quality":"Data-quality score spot candles, higher timeframe, futures, news এবং BTC/ETH filter availability দেখায়। Missing source অনুমান করা হয় না।",
@@ -919,6 +946,20 @@ def requested_detail_mode(prompt: str, saved_mode: str) -> str:
     return saved_mode
 
 
+def comparison_text(previous: Any,current: dict[str,Any]) -> str:
+    if not previous: return ""
+    try:
+        old=json.loads(previous) if isinstance(previous,str) else previous; changes=[]
+        if old.get("breakout",{}).get("state")!=current["breakout"]["state"]: changes.append(f"State: {old.get('breakout',{}).get('state','?')} → {current['breakout']['state']}")
+        for key,label,suffix in (("rsi","RSI",""),("volume_ratio","Volume","x")):
+            before=float(old.get(key,0)); after=float(current.get(key,0))
+            if abs(after-before)>.01: changes.append(f"{label}: {before:.2f} → {after:.2f}{suffix}")
+        old_dist=old.get("breakout",{}).get("distance_to_bullish_pct"); new_dist=current["breakout"].get("distance_to_bullish_pct")
+        if old_dist is not None and new_dist is not None: changes.append(f"Bull trigger distance: {float(old_dist):.2f}% → {float(new_dist):.2f}%")
+        return "\n\nPrevious analysis থেকে পরিবর্তন\n"+"\n".join(f"• {x}" for x in changes[:5]) if changes else ""
+    except Exception: return ""
+
+
 def quick_report(request: Request, result: dict[str,Any]) -> str:
     q=result["quant"]; b=q["breakout"]
     return (f"{request.symbol} — {request.timeframe}\n\n"
@@ -945,6 +986,8 @@ async def run_request(update: Update, request: Request) -> None:
                 result["analysis_bn"]=quick_report(request,result)
             if BOT.db and update.effective_user:
                 await BOT.ensure_user(update)
+                previous=await BOT.db.fetchval("SELECT payload FROM analyses WHERE telegram_id=$1 AND symbol=$2 AND timeframe=$3 ORDER BY created_at DESC LIMIT 1",update.effective_user.id,request.symbol,request.timeframe)
+                result["analysis_bn"] += comparison_text(previous,result["quant"])
                 await BOT.db.execute("INSERT INTO analyses(telegram_id,symbol,timeframe,state,price,payload) VALUES($1,$2,$3,$4,$5,$6::jsonb)",
                     update.effective_user.id,request.symbol,request.timeframe,result["quant"]["breakout"]["state"],float(frame.Close.iloc[-1]),json.dumps(result["quant"]))
             # Matplotlib is CPU-bound and not thread-safe; render promptly in event thread.
@@ -976,6 +1019,14 @@ async def run_request(update: Update, request: Request) -> None:
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     text=update.effective_message.text.lower()
+    if any(x in text for x in ("খবর","নিউজ","news","মিটিং","meeting","প্রোগ্রাম","program","event","ইভেন্ট","ভাষণ","speech")):
+        generic=any(x in text for x in ("পুরো ক্রিপ্টো","crypto market","সব খবর","all crypto"))
+        if generic: context.args=["all"]
+        else:
+            try:
+                parsed=await BOT.parse_text(update.effective_message.text); context.args=[parsed.symbol.split('/')[0]]
+            except UserInputError: context.args=["all"]
+        await events_command(update,context); return
     if ("কোন কয়েন" in text or "কোন কয়েন" in text or "which coin" in text) and any(x in text for x in ("breakout","breakdown","ব্রেকআউট","ব্রেকডাউন")):
         context.args=["4h"]
         await scanner_command(update,context); return
@@ -1035,7 +1086,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await q.message.reply_text("Pending requests" if rows else "Pending request নেই।",reply_markup=InlineKeyboardMarkup(buttons)); return
             if data=="adminusers":
                 rows=await BOT.db.fetch("SELECT telegram_id,username,plan,plan_until,blocked FROM users ORDER BY created_at DESC LIMIT 30")
-                buttons=[[InlineKeyboardButton(f"{'🚫' if r['blocked'] else '✅'} {r['telegram_id']} @{r['username'] or '-'}",callback_data=f"admuser|{r['telegram_id']}")] for r in rows]
+                buttons=[[InlineKeyboardButton(f"{'🚫' if r['blocked'] else '✅'} @{r['username'] or 'no_username'}",callback_data=f"admuser|{r['telegram_id']}")] for r in rows]
                 buttons.append([InlineKeyboardButton("← Admin",callback_data="adminhome")])
                 await q.message.reply_text("সাম্প্রতিক users:",reply_markup=InlineKeyboardMarkup(buttons)); return
             if data=="adminhealth":
@@ -1043,13 +1094,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if parts[0]=="admreq" and len(parts)==2:
                 r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1",int(parts[1]))
                 if not r: await q.message.reply_text("Request পাওয়া যায়নি।"); return
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{r['id']}")]])
-                await q.message.reply_text(f"Request #{r['id']}\nUser: {r['telegram_id']}\nDays: {r['days']}\nStatus: {r['status']}",reply_markup=kb); return
+                approve_cmd=f"/approve {r['telegram_id']} {r['days']}"
+                kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{r['id']}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{r['id']}")],[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(r['telegram_id']))),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))]])
+                await q.message.reply_text(f"Request #{r['id']}\nUser: <code>{r['telegram_id']}</code>\nDays: {r['days']}\nStatus: {r['status']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
             if parts[0]=="admacc" and len(parts)==2:
                 r=await BOT.db.fetchrow("SELECT * FROM subscription_requests WHERE id=$1 AND status='pending'",int(parts[1]))
                 if not r: await q.message.reply_text("Request pending নেই।"); return
                 await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE WHERE telegram_id=$1",r['telegram_id'],r['days'])
                 await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE id=$1",r['id'])
+                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve',$2,$3::jsonb)",update.effective_user.id,r['telegram_id'],json.dumps({"days":r['days'],"request_id":r['id']}))
                 await set_user_menu(context.bot,r['telegram_id'],"pro")
                 await context.bot.send_message(r['telegram_id'],f"🎉 আপনার Pro access অনুমোদিত হয়েছে।\nমেয়াদ: {r['days']} দিন\n/guide দিয়ে সব সুবিধা দেখুন।")
                 await q.edit_message_reply_markup(reply_markup=None); await q.message.reply_text("✅ Approved"); return
@@ -1062,11 +1115,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 uid=int(parts[1]); r=await BOT.db.fetchrow("SELECT * FROM users WHERE telegram_id=$1",uid)
                 if not r: await q.message.reply_text("User নেই।"); return
                 action="admunblock" if r['blocked'] else "admblock"; label="✅ Unblock" if r['blocked'] else "🚫 Block"
-                kb=InlineKeyboardMarkup([[InlineKeyboardButton(label,callback_data=f"{action}|{uid}")],[InlineKeyboardButton("← Users",callback_data="adminusers")]])
-                await q.message.reply_text(f"User: {uid}\n@{r['username'] or '-'}\nPlan: {r['plan']}\nUntil: {r['plan_until']}\nBlocked: {r['blocked']}",reply_markup=kb); return
+                kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(uid)))],[InlineKeyboardButton("+7 দিন",callback_data=f"admext|{uid}|7"),InlineKeyboardButton("+30 দিন",callback_data=f"admext|{uid}|30"),InlineKeyboardButton("+90 দিন",callback_data=f"admext|{uid}|90")],[InlineKeyboardButton(label,callback_data=f"{action}|{uid}")],[InlineKeyboardButton("← Users",callback_data="adminusers")]])
+                await q.message.reply_text(f"User: <code>{uid}</code>\n@{html.escape(r['username'] or '-')}\nPlan: {r['plan']}\nUntil: {r['plan_until']}\nBlocked: {r['blocked']}",reply_markup=kb,parse_mode=ParseMode.HTML); return
+            if parts[0]=="admext" and len(parts)==3:
+                uid,days=int(parts[1]),int(parts[2]); await BOT.db.execute("UPDATE users SET plan='pro',plan_until=GREATEST(COALESCE(plan_until,NOW()),NOW())+$2*INTERVAL '1 day',expiry_3d_sent=FALSE,expiry_1d_sent=FALSE WHERE telegram_id=$1",uid,days)
+                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'extend',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
+                await set_user_menu(context.bot,uid,"pro")
+                try: await context.bot.send_message(uid,f"✅ আপনার Pro access {days} দিন বাড়ানো হয়েছে।")
+                except Exception: pass
+                await q.message.reply_text(f"✅ User {uid}: +{days} days"); return
             if parts[0] in {"admblock","admunblock"} and len(parts)==2:
                 uid=int(parts[1]); blocked=parts[0]=="admblock"
                 await BOT.db.execute("UPDATE users SET blocked=$1 WHERE telegram_id=$2",blocked,uid)
+                await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,$2,$3,'{}'::jsonb)",update.effective_user.id,"block" if blocked else "unblock",uid)
                 await set_user_menu(context.bot,uid,"free" if blocked else await BOT.effective_plan(uid))
                 try: await context.bot.send_message(uid,"আপনার bot access block করা হয়েছে।" if blocked else "আপনার bot access unblock করা হয়েছে।")
                 except Exception: pass
@@ -1081,6 +1142,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text(detail,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← মূল Guide",callback_data="guidehome")]])); return
         if parts[0]=="an" and len(parts)==3:
             await run_request(update,Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]))); return
+        if parts[0]=="evrem" and len(parts)==2 and parts[1].isdigit():
+            if not BOT.db: await q.message.reply_text("DATABASE_URL সেট করা নেই।"); return
+            eid=int(parts[1]); event=await BOT.db.fetchrow("SELECT * FROM market_events WHERE id=$1 AND active AND starts_at>NOW()",eid)
+            if not event: await q.message.reply_text("Event পাওয়া যায়নি অথবা ইতোমধ্যে শেষ।"); return
+            await BOT.ensure_user(update)
+            await BOT.db.execute("INSERT INTO event_reminders(telegram_id,event_id,chat_id) VALUES($1,$2,$3) ON CONFLICT(telegram_id,event_id) DO UPDATE SET active=NOT event_reminders.active,sent_24h=FALSE,sent_1h=FALSE,sent_10m=FALSE",update.effective_user.id,eid,update.effective_chat.id)
+            active=await BOT.db.fetchval("SELECT active FROM event_reminders WHERE telegram_id=$1 AND event_id=$2",update.effective_user.id,eid)
+            await q.message.reply_text("✅ Reminder চালু হয়েছে।" if active else "⏹ Reminder বন্ধ হয়েছে।"); return
         if parts[0]=="wlrm" and len(parts)==2:
             symbol=BOT._normalize_symbol(parts[1]); await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1 AND symbol=$2",update.effective_user.id,symbol)
             await q.message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে। /watchlist দিয়ে নতুন তালিকা দেখুন।"); return
@@ -1129,7 +1198,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             approve_cmd=f"/approve {update.effective_user.id} {days}"
             admin_msg=(f"নতুন subscription request #{rid}\nUser: <code>{update.effective_user.id}</code> (@{html.escape(update.effective_user.username or 'none')})\n"
                        f"Plan: Pro {days} days\nApprove command:\n<code>{approve_cmd}</code>\n\nMono command-এ tap/hold করে copy করতে পারবেন।")
-            admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("📋 Copy approve command",copy_text=CopyTextButton(approve_cmd))],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
+            admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(update.effective_user.id))),InlineKeyboardButton("📋 Copy command",copy_text=CopyTextButton(approve_cmd))],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
             for admin_id in ADMIN_IDS:
                 try: await context.bot.send_message(admin_id,admin_msg,reply_markup=admin_kb,parse_mode=ParseMode.HTML)
                 except Exception: log.warning("Could not notify admin %s",admin_id)
@@ -1324,6 +1393,82 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text="\n\n".join(f"#{r['id']} {r['symbol']} {r['timeframe']} {r['direction'].upper()}\nEntry {r['entry']:.8g} | SL {r['stop']:.8g} | TP {r['target']:.8g}\nStatus: {r['status']}" for r in rows) or "কোনো paper trade নেই।"
     await send_long(update.effective_message,text)
 
+async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show upcoming admin-curated events plus fresh free RSS headlines."""
+    assert BOT is not None
+    raw=context.args[0] if context.args else "BTC"
+    all_market=raw.lower() in {"all","crypto","market","সব"}
+    try: symbol=None if all_market else BOT._normalize_symbol(raw)
+    except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
+    settings=await BOT.user_settings(update.effective_user.id); from zoneinfo import ZoneInfo
+    tz=ZoneInfo(settings["timezone"]); rows=[]
+    if BOT.db:
+        if symbol: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() AND (symbol=$1 OR symbol='ALL') ORDER BY starts_at LIMIT 20",symbol)
+        else: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() ORDER BY starts_at LIMIT 20")
+    request=Request(symbol or "BTC/USDT","4h"); context_data=await BOT.external_context(request)
+    lines=[f"Upcoming Crypto Events — {symbol or 'All Market'}",f"সময়: {settings['timezone']}"]
+    if rows:
+        for r in rows:
+            local=r['starts_at'].astimezone(tz); lines.append(f"\n#{r['id']} • {r['impact'].upper()}\n{local.strftime('%d %b %Y, %I:%M %p')}\n{r['symbol']} — {r['title']}"+(f"\n{r['source_url']}" if r['source_url'] else ""))
+    else: lines.append("\nDatabase-এ আসন্ন নির্ধারিত event পাওয়া যায়নি।")
+    news=context_data.get("news",[])
+    lines.append("\nসাম্প্রতিক RSS News")
+    if news:
+        for n in news[:6]: lines.append(f"\n• {n['title']}\nSource: {n.get('source','Unknown')} | Age: {n.get('age_hours','?')}h\n{n.get('link','')}")
+    else: lines.append("\nপ্রাসঙ্গিক fresh RSS headline পাওয়া যায়নি।")
+    lines.append("\nনির্ধারিত event admin-curated; RSS headline independently fact-checked নয়।")
+    await send_long(update.effective_message,"\n".join(lines))
+    if rows:
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"⏰ Remind me — #{r['id']} {r['symbol']}",callback_data=f"evrem|{r['id']}")] for r in rows[:10]])
+        await update.effective_message.reply_text("Event reminder নির্বাচন করুন। ২৪ ঘণ্টা, ১ ঘণ্টা ও ১০ মিনিট আগে notification যাবে।",reply_markup=kb)
+
+async def event_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("Admin only।"); return
+    if not BOT.db or len(context.args)<4:
+        await update.effective_message.reply_text("ব্যবহার: /event_add BTC 2026-09-29T06:00:00+06:00 high Event title\nসব market-এর জন্য symbol ALL দিন।"); return
+    raw,when,impact=context.args[:3]; title=" ".join(context.args[3:]).strip(); impact=impact.lower()
+    if impact not in {"low","medium","high"}: await update.effective_message.reply_text("Impact: low, medium অথবা high"); return
+    try:
+        symbol="ALL" if raw.upper()=="ALL" else BOT._normalize_symbol(raw)
+        starts=datetime.fromisoformat(when)
+        if starts.tzinfo is None: raise ValueError
+    except Exception: await update.effective_message.reply_text("Symbol অথবা ISO time ভুল। Timezone দিন, যেমন 2026-09-29T06:00:00+06:00"); return
+    eid=await BOT.db.fetchval("INSERT INTO market_events(symbol,starts_at,impact,title,created_by) VALUES($1,$2,$3,$4,$5) RETURNING id",symbol,starts,impact,title,update.effective_user.id)
+    await update.effective_message.reply_text(f"✅ Event #{eid} যোগ হয়েছে।")
+
+async def event_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("Admin only।"); return
+    if not BOT.db or not context.args or not context.args[0].isdigit(): await update.effective_message.reply_text("ব্যবহার: /event_delete EVENT_ID"); return
+    result=await BOT.db.execute("UPDATE market_events SET active=FALSE WHERE id=$1",int(context.args[0]))
+    await update.effective_message.reply_text("✅ Event সরানো হয়েছে।" if result.endswith("1") else "Event পাওয়া যায়নি।")
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context; assert BOT is not None
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    uid=update.effective_user.id
+    monitors=await BOT.db.fetch("SELECT symbol,timeframe,event_filter FROM alerts WHERE telegram_id=$1 AND active ORDER BY id LIMIT 10",uid)
+    trades=await BOT.db.fetchval("SELECT count(*) FROM paper_trades WHERE telegram_id=$1 AND status='active'",uid)
+    reminders=await BOT.db.fetchval("SELECT count(*) FROM event_reminders WHERE telegram_id=$1 AND active",uid)
+    watch=await BOT.db.fetchval("SELECT count(*) FROM watchlists WHERE telegram_id=$1",uid)
+    lines=["Monitoring Dashboard",f"Active monitors: {len(monitors)}",f"Active paper trades: {trades}",f"Event reminders: {reminders}",f"Watchlist coins: {watch}"]
+    for r in monitors[:5]:
+        try:
+            frame=await BOT.fetch_candles(Request(r['symbol'],r['timeframe'])); q=quant_snapshot(frame); b=q['breakout']; distance=min(abs(b['distance_to_bullish_pct']),abs(b['distance_to_bearish_pct']))
+            lines.append(f"\n{r['symbol']} • {r['timeframe']}\n{b['state']} | nearest trigger {distance:.2f}% | volume {b['volume_ratio']:.2f}x")
+        except Exception: lines.append(f"\n{r['symbol']} • data unavailable")
+    await send_long(update.effective_message,"\n".join(lines))
+
+async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context; assert BOT is not None
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    rows=await BOT.db.fetch("SELECT direction,entry,stop,target,status,exit_price FROM paper_trades WHERE telegram_id=$1 AND status!='active'",update.effective_user.id)
+    if not rows: await update.effective_message.reply_text("Closed paper trade নেই।"); return
+    wins=sum(r['status']=='target_hit' for r in rows); losses=sum(r['status']=='stop_hit' for r in rows); total=len(rows)
+    net_r=wins*2-losses; win_rate=wins/total*100
+    await update.effective_message.reply_text(f"Paper Trade Performance\n\nClosed trades: {total}\nTargets hit: {wins}\nStops hit: {losses}\nWin rate: {win_rate:.1f}%\nApprox net: {net_r:.1f}R\n\nDefault approximation 2R target ধরে; এটি real P/L নয়।")
+
 async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
@@ -1378,6 +1523,17 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     scan=BOT.last_alert_scan.isoformat(timespec="seconds") if BOT.last_alert_scan else "not yet"
     await update.effective_message.reply_text(f"Health\n\nBot: ok\nDatabase: {db}\nExchange: {exchange}\nGemini model: {MODEL_NAME}\nLast alert scan: {scan}\nCache entries: {len(BOT.cache._data)}")
 
+async def user_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("Admin only।"); return
+    if not BOT.db or not context.args: await update.effective_message.reply_text("ব্যবহার: /user USER_ID অথবা /user @username"); return
+    raw=context.args[0]
+    row=await (BOT.db.fetchrow("SELECT * FROM users WHERE telegram_id=$1",int(raw)) if raw.isdigit() else BOT.db.fetchrow("SELECT * FROM users WHERE lower(username)=lower($1)",raw.lstrip('@')))
+    if not row: await update.effective_message.reply_text("User পাওয়া যায়নি।"); return
+    uid=row['telegram_id']; action="admunblock" if row['blocked'] else "admblock"; label="✅ Unblock" if row['blocked'] else "🚫 Block"
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy User ID",copy_text=CopyTextButton(str(uid)))],[InlineKeyboardButton("+7 দিন",callback_data=f"admext|{uid}|7"),InlineKeyboardButton("+30 দিন",callback_data=f"admext|{uid}|30"),InlineKeyboardButton("+90 দিন",callback_data=f"admext|{uid}|90")],[InlineKeyboardButton(label,callback_data=f"{action}|{uid}")]])
+    await update.effective_message.reply_text(f"User: <code>{uid}</code>\n@{html.escape(row['username'] or '-')}\nPlan: {row['plan']}\nUntil: {row['plan_until']}\nBlocked: {row['blocked']}",parse_mode=ParseMode.HTML,reply_markup=kb)
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
     if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("অনুমতি নেই।"); return
@@ -1398,7 +1554,8 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not BOT.db or len(context.args)<2 or not context.args[0].isdigit() or not context.args[1].isdigit():
         await update.effective_message.reply_text("ব্যবহার: /approve USER_ID DAYS"); return
     uid,days=int(context.args[0]),min(3650,int(context.args[1]))
-    await BOT.db.execute("INSERT INTO users(telegram_id,plan,plan_until) VALUES($1,'pro',NOW()+$2*INTERVAL '1 day') ON CONFLICT(telegram_id) DO UPDATE SET plan='pro',plan_until=NOW()+$2*INTERVAL '1 day'",uid,days)
+    await BOT.db.execute("INSERT INTO users(telegram_id,plan,plan_until) VALUES($1,'pro',NOW()+$2*INTERVAL '1 day') ON CONFLICT(telegram_id) DO UPDATE SET plan='pro',plan_until=GREATEST(COALESCE(users.plan_until,NOW()),NOW())+$2*INTERVAL '1 day',blocked=FALSE,expiry_3d_sent=FALSE,expiry_1d_sent=FALSE",uid,days)
+    await BOT.db.execute("INSERT INTO admin_audit_log(admin_id,action,target_user_id,details) VALUES($1,'approve_command',$2,$3::jsonb)",update.effective_user.id,uid,json.dumps({"days":days}))
     await BOT.db.execute("UPDATE subscription_requests SET status='approved',reviewed_at=NOW() WHERE telegram_id=$1 AND status='pending'",uid)
     await set_user_menu(context.bot,uid,"pro")
     await update.effective_message.reply_text(f"✅ User {uid}: Pro for {days} days")
@@ -1454,6 +1611,43 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(r['chat_id'],f"{icon} Paper trade #{r['id']} — {outcome.replace('_',' ').title()}\n{r['symbol']} • {r['timeframe']}\nExit: {exit_price:.8g}\nClosed candle: {frame.index[-1].isoformat()[:16]}\n\nএটি virtual monitoring; real order execute হয়নি।")
         except Exception: log.exception("Trade monitor failed id=%s",r['id'])
 
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if not BOT.db: return
+    rows=await BOT.db.fetch("""SELECT r.*,e.symbol,e.title,e.starts_at,e.impact FROM event_reminders r JOIN market_events e ON e.id=r.event_id
+      WHERE r.active AND e.active AND e.starts_at>NOW() AND e.starts_at<=NOW()+INTERVAL '24 hours 5 minutes'""")
+    now=datetime.now(timezone.utc)
+    for r in rows:
+        seconds=(r['starts_at']-now).total_seconds(); column=None; label=None
+        if seconds<=600 and not r['sent_10m']: column,label="sent_10m","১০ মিনিট"
+        elif seconds<=3600 and not r['sent_1h']: column,label="sent_1h","১ ঘণ্টা"
+        elif seconds<=86400 and not r['sent_24h']: column,label="sent_24h","২৪ ঘণ্টা"
+        if column:
+            try:
+                await context.bot.send_message(r['chat_id'],f"⏰ Crypto Event Reminder\n\n{r['symbol']} — {r['title']}\nImpact: {r['impact'].upper()}\nশুরু হবে আনুমানিক {label} পরে।\nUTC: {r['starts_at'].isoformat()}\n\nEvent-এর সময় volatility বাড়তে পারে।")
+                await BOT.db.execute(f"UPDATE event_reminders SET {column}=TRUE WHERE telegram_id=$1 AND event_id=$2",r['telegram_id'],r['event_id'])
+            except Exception: log.exception("Event reminder failed")
+
+async def subscription_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if not BOT.db: return
+    rows=await BOT.db.fetch("SELECT telegram_id,plan_until,expiry_3d_sent,expiry_1d_sent FROM users WHERE plan='pro' AND NOT blocked AND plan_until IS NOT NULL AND plan_until<=NOW()+INTERVAL '3 days'")
+    now=datetime.now(timezone.utc)
+    for r in rows:
+        seconds=(r['plan_until']-now).total_seconds()
+        if seconds<=0:
+            await BOT.db.execute("UPDATE users SET plan='free' WHERE telegram_id=$1",r['telegram_id']); await set_user_menu(context.bot,r['telegram_id'],"free")
+            try: await context.bot.send_message(r['telegram_id'],"আপনার Pro access-এর মেয়াদ শেষ হয়েছে। পুনরায় নিতে /subscribe পাঠান।")
+            except Exception: pass
+        elif seconds<=86400 and not r['expiry_1d_sent']:
+            await BOT.db.execute("UPDATE users SET expiry_1d_sent=TRUE WHERE telegram_id=$1",r['telegram_id'])
+            try: await context.bot.send_message(r['telegram_id'],"আপনার Pro access ২৪ ঘণ্টার মধ্যে শেষ হবে।")
+            except Exception: pass
+        elif seconds<=259200 and not r['expiry_3d_sent']:
+            await BOT.db.execute("UPDATE users SET expiry_3d_sent=TRUE WHERE telegram_id=$1",r['telegram_id'])
+            try: await context.bot.send_message(r['telegram_id'],"আপনার Pro access ৩ দিনের মধ্যে শেষ হবে।")
+            except Exception: pass
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, RetryAfter):
         log.warning("Telegram flood control: retry after %s", context.error.retry_after)
@@ -1464,9 +1658,9 @@ PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand(
 PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive guide"),BotCommand("settings","Report settings"),
  BotCommand("monitor","Strong breakout monitor"),BotCommand("alerts","Active monitors"),BotCommand("watchlist","Watchlist ও monitoring"),
  BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
- BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("backtest","Backtest"),
- BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("risk","Position size")]
-ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("admin","Admin panel"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
+ BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("events","Upcoming events ও news"),BotCommand("backtest","Backtest"),
+ BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("performance","Paper performance"),BotCommand("dashboard","Monitoring dashboard"),BotCommand("risk","Position size")]
+ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("event_add","Scheduled event যোগ"),BotCommand("event_delete","Event সরান"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
@@ -1484,6 +1678,8 @@ async def post_init(application: Application) -> None:
     if application.job_queue:
         application.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=20, name="breakout-alert-monitor")
         application.job_queue.run_repeating(trade_job, interval=ALERT_INTERVAL, first=35, name="paper-trade-monitor")
+        application.job_queue.run_repeating(reminder_job, interval=60, first=45, name="event-reminders")
+        application.job_queue.run_repeating(subscription_expiry_job, interval=3600, first=60, name="subscription-expiry")
 
 async def post_shutdown(application: Application) -> None:
     del application
@@ -1494,8 +1690,12 @@ async def post_shutdown(application: Application) -> None:
 def protected(handler: Any) -> Any:
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         assert BOT is not None
-        if not await BOT.has_access(update.effective_user.id if update.effective_user else None):
+        uid=update.effective_user.id if update.effective_user else None
+        if not await BOT.has_access(uid):
             await deny_unapproved(update,context); return
+        name=getattr(handler,"__name__",""); action="voice" if "voice" in name else "scanner" if "scanner" in name else "analysis" if name in {"text_handler","run_request"} else "general"
+        allowed,retry=await BOT.allow_request(uid,action)
+        if not allowed: await update.effective_message.reply_text(f"Rate limit হয়েছে। {retry} সেকেন্ড পরে আবার চেষ্টা করুন।"); return
         await handler(update,context)
     return wrapper
 
@@ -1516,6 +1716,9 @@ def main() -> None:
     app.add_handler(CommandHandler("risk", protected(risk_command)))
     app.add_handler(CommandHandler("backtest", protected(backtest_command)))
     app.add_handler(CommandHandler("scanner", protected(scanner_command)))
+    app.add_handler(CommandHandler("events", protected(events_command)))
+    app.add_handler(CommandHandler("event_add", event_add_command))
+    app.add_handler(CommandHandler("event_delete", event_delete_command))
     app.add_handler(CommandHandler("timezone", protected(timezone_command)))
     app.add_handler(CommandHandler("health", protected(health_command)))
     app.add_handler(CommandHandler("alert", protected(alert_command)))
@@ -1523,11 +1726,14 @@ def main() -> None:
     app.add_handler(CommandHandler("alerts", protected(alerts_command)))
     app.add_handler(CommandHandler("trade", protected(trade_command)))
     app.add_handler(CommandHandler("trades", protected(trades_command)))
+    app.add_handler(CommandHandler("performance", protected(performance_command)))
+    app.add_handler(CommandHandler("dashboard", protected(dashboard_command)))
     app.add_handler(CommandHandler("delete_alert", protected(delete_alert_command)))
     app.add_handler(CommandHandler("watchlist", protected(watchlist_command)))
     app.add_handler(CommandHandler("watchlist_remove", protected(watchlist_remove_command)))
     app.add_handler(CommandHandler("watchlist_clear", protected(watchlist_clear_command)))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("user", user_search_command))
     app.add_handler(CommandHandler("stats", admin_stats_command))
     app.add_handler(CommandHandler("approve", approve_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
