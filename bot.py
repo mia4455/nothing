@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import html
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import asyncpg
@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import signal
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,7 +36,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from pro_quant import position_size, snapshot as professional_snapshot
 from pro_features import TTLCache, data_quality, event_fingerprint, explainable_score, retest_state
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
+from telegram import BotCommand, BotCommandScopeChat, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -215,26 +216,37 @@ def quant_snapshot(df: pd.DataFrame) -> dict[str, Any]:
             "breakout":breakout,"professional":professional}
 
 
-def scan_breakout_history(df: pd.DataFrame, lookback: int = 20) -> list[dict[str, Any]]:
-    """Walk candles without look-ahead and return confirmed/false range breaks."""
-    events=[]
-    vol_ma=df.Volume.rolling(20).mean()
-    atr=pd.concat([(df.High-df.Low),(df.High-df.Close.shift()).abs(),(df.Low-df.Close.shift()).abs()],axis=1).max(axis=1).rolling(14).mean()
+def timeframe_delta(timeframe: str) -> timedelta:
+    unit=timeframe[-1].lower(); value=int(timeframe[:-1])
+    return {"m":timedelta(minutes=value),"h":timedelta(hours=value),"d":timedelta(days=value),"w":timedelta(weeks=value)}[unit]
+
+
+def scan_breakout_history(df: pd.DataFrame, lookback: int = 20, timeframe: str = "4h") -> list[dict[str, Any]]:
+    """Walk closed candles without look-ahead and emit state transitions only.
+
+    A continuing move above the rolling range is one breakout, not a fresh
+    breakout every candle. The direction must reset before another same-side
+    confirmation can be emitted.
+    """
+    events=[]; vol_ma=df.Volume.rolling(20).mean(); active_direction=None; last_false_idx=-99
     for i in range(max(lookback, 20), len(df)):
         prior=df.iloc[i-lookback:i]; row=df.iloc[i]
         hi,lo=float(prior.High.max()),float(prior.Low.min())
         vr=float(row.Volume/max(vol_ma.iloc[i],1e-12)); body=abs(float(row.Close-row.Open))/max(float(row.High-row.Low),1e-12)
-        state=None; level=None
-        if row.Close>hi and vr>=1.25 and body>=.5: state,level="BREAKOUT_CONFIRMED",hi
-        elif row.Close<lo and vr>=1.25 and body>=.5: state,level="BREAKDOWN_CONFIRMED",lo
-        elif row.High>hi and row.Close<=hi: state,level="FALSE_BREAKOUT",hi
-        elif row.Low<lo and row.Close>=lo: state,level="FALSE_BREAKDOWN",lo
+        state=None; level=None; direction=None
+        if row.Close>hi and vr>=1.25 and body>=.5: state,level,direction="BREAKOUT_CONFIRMED",hi,"up"
+        elif row.Close<lo and vr>=1.25 and body>=.5: state,level,direction="BREAKDOWN_CONFIRMED",lo,"down"
+        elif row.High>hi and row.Close<=hi and i-last_false_idx>=3: state,level="FALSE_BREAKOUT",hi; last_false_idx=i
+        elif row.Low<lo and row.Close>=lo and i-last_false_idx>=3: state,level="FALSE_BREAKDOWN",lo; last_false_idx=i
+        # Returning inside the prior range rearms the state machine.
+        if lo <= row.Close <= hi: active_direction=None
+        if direction and direction==active_direction: state=None
+        elif direction: active_direction=direction
         if state:
-            future=df.iloc[i+1:min(i+11,len(df))]
-            move=0.0
-            if len(future):
-                move=((float(future.High.max())/float(row.Close)-1)*100 if "BREAKOUT" in state else (1-float(future.Low.min())/float(row.Close))*100)
-            events.append({"time":df.index[i].isoformat(),"state":state,"level":level,"close":float(row.Close),
+            future=df.iloc[i+1:min(i+11,len(df))]; move=0.0
+            if len(future): move=((float(future.High.max())/float(row.Close)-1)*100 if "BREAKOUT" in state else (1-float(future.Low.min())/float(row.Close))*100)
+            open_time=df.index[i].to_pydatetime(); close_time=open_time+timeframe_delta(timeframe)
+            events.append({"time":open_time.isoformat(),"close_time":close_time.isoformat(),"state":state,"level":level,"close":float(row.Close),
                            "volume_ratio":vr,"body_strength":body,"max_follow_through_10_candles_pct":move})
     return events[-20:]
 
@@ -309,6 +321,13 @@ class AnalystBot:
                   direction TEXT NOT NULL, entry DOUBLE PRECISION NOT NULL, stop DOUBLE PRECISION NOT NULL,
                   target DOUBLE PRECISION NOT NULL, status TEXT NOT NULL DEFAULT 'active',
                   opened_at TIMESTAMPTZ DEFAULT NOW(), closed_at TIMESTAMPTZ, exit_price DOUBLE PRECISION);
+                CREATE TABLE IF NOT EXISTS breakout_events(
+                  id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+                  candle_open TIMESTAMPTZ NOT NULL, candle_close TIMESTAMPTZ NOT NULL,
+                  event_type TEXT NOT NULL, level DOUBLE PRECISION NOT NULL, close_price DOUBLE PRECISION,
+                  volume_ratio DOUBLE PRECISION, body_strength DOUBLE PRECISION,
+                  created_at TIMESTAMPTZ DEFAULT NOW(),
+                  UNIQUE(symbol,timeframe,candle_open,event_type));
             """)
             # Idempotent lightweight migrations for the compact deployment.
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS detail_mode TEXT NOT NULL DEFAULT 'standard'")
@@ -345,11 +364,13 @@ class AnalystBot:
         row=await self.db.fetchrow("SELECT admin_notified FROM users WHERE telegram_id=$1",update.effective_user.id)
         if row and row["admin_notified"]: return
         u=update.effective_user
-        text=(f"নতুন user bot access চেয়েছে\n\nName: {u.full_name}\nUsername: @{u.username or 'none'}\nUser ID: {u.id}\n"
-              f"Approve 30 days: /approve {u.id} 30")
+        command=f"/approve {u.id} 30"
+        text=(f"নতুন user bot access চেয়েছে\n\nName: {html.escape(u.full_name)}\nUsername: @{html.escape(u.username or 'none')}\nUser ID: <code>{u.id}</code>\n"
+              f"Approve 30 days:\n<code>{command}</code>\n\nউপরের mono command-এ tap/hold করে copy করুন।")
+        copy_kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy approve command",copy_text=CopyTextButton(command))]])
         delivered=False
         for admin_id in ADMIN_IDS:
-            try: await context.bot.send_message(admin_id,text); delivered=True
+            try: await context.bot.send_message(admin_id,text,parse_mode=ParseMode.HTML,reply_markup=copy_kb); delivered=True
             except Exception: log.warning("Could not notify admin %s",admin_id)
         if delivered: await self.db.execute("UPDATE users SET admin_notified=TRUE WHERE telegram_id=$1",u.id)
 
@@ -510,21 +531,31 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
                 feeds = ["https://www.coindesk.com/arc/outboundfeeds/rss/", "https://cointelegraph.com/rss"]
                 payloads = await asyncio.gather(*(session.get(url) for url in feeds), return_exceptions=True)
                 entries=[]
-                for response in payloads:
+                for url,response in zip(feeds,payloads):
                     if isinstance(response, Exception): continue
                     try:
-                        raw = await response.read()
-                        entries.extend(feedparser.parse(raw).entries[:12])
+                        raw = await response.read(); source="CoinDesk" if "coindesk" in url else "Cointelegraph"
+                        entries.extend((source,item) for item in feedparser.parse(raw).entries[:15])
                     finally: response.release()
-                base = request.symbol.split("/")[0]
-                keywords = {base.lower(), request.symbol.lower(), "crypto", "bitcoin", "ethereum", "market", "regulation"}
-                seen=set()
-                for item in entries:
-                    title=str(item.get("title", "")).strip(); summary=re.sub("<[^>]+>", " ", str(item.get("summary", "")))
-                    if title and title.lower() not in seen and any(k in (title+" "+summary).lower() for k in keywords):
-                        seen.add(title.lower()); context["news"].append({"title":title[:240], "link":str(item.get("link", ""))[:500],
-                            "published":str(item.get("published", "unknown"))[:80]})
-                    if len(context["news"]) >= 6: break
+                base = request.symbol.split("/")[0].lower()
+                aliases={"btc":{"btc","bitcoin"},"eth":{"eth","ethereum"},"bnb":{"bnb","binance coin","binance"},"sui":{"sui"},"sei":{"sei"},"sol":{"sol","solana"}}
+                coin_terms=aliases.get(base,{base}); global_terms={"bitcoin","ethereum","crypto market","regulation","fed","etf"}
+                seen=set(); coin_news=[]; global_news=[]; now=datetime.now(timezone.utc)
+                for source,item in entries:
+                    title=str(item.get("title", "")).strip(); summary=re.sub("<[^>]+>", " ", str(item.get("summary", ""))); hay=(title+" "+summary).lower()
+                    if not title or title.lower() in seen: continue
+                    published_raw=str(item.get("published", "")); age_hours=None
+                    try:
+                        dt=parsedate_to_datetime(published_raw)
+                        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+                        age_hours=max(0,(now-dt.astimezone(timezone.utc)).total_seconds()/3600)
+                    except Exception: pass
+                    if age_hours is not None and age_hours>168: continue
+                    record={"title":title[:240],"link":str(item.get("link", ""))[:500],"published":published_raw[:80] or "unknown","age_hours":round(age_hours,1) if age_hours is not None else None,"source":source}
+                    if any(term in hay for term in coin_terms): coin_news.append(record); seen.add(title.lower())
+                    elif any(term in hay for term in global_terms): global_news.append(record); seen.add(title.lower())
+                context["news"]=(coin_news[:4]+global_news[:2])[:6]
+                context["news_scope"]={"coin_specific":len(coin_news[:4]),"global_market":len(global_news[:2])}
                 context["news_status"] = "live_rss" if context["news"] else "no_relevant_headlines"
         except Exception as exc:
             log.warning("External context unavailable: %s", exc)
@@ -1065,9 +1096,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             row=await BOT.db.fetchrow("INSERT INTO alerts(telegram_id,chat_id,symbol,timeframe) VALUES($1,$2,$3,$4) ON CONFLICT(telegram_id,symbol,timeframe) DO UPDATE SET active=TRUE RETURNING id",update.effective_user.id,update.effective_chat.id,symbol,tf)
             await q.message.reply_text(f"✅ Alert #{row['id']} চালু: {symbol} {tf}"); return
         if parts[0]=="hi" and len(parts)==3:
-            req=Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2])); frame=await BOT.fetch_candles(req); events=scan_breakout_history(frame)
-            lines=[f"{req.symbol} • {req.timeframe} history"]+[f"{e['time'][:16]} — {e['state']} — {e['level']:.8g}" for e in events[-10:]]
-            await send_long(q.message,"\n".join(lines) if len(lines)>1 else "কোনো event পাওয়া যায়নি।"); return
+            req=Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2])); frame=await BOT.fetch_candles(req); events=scan_breakout_history(frame,timeframe=req.timeframe)
+            await save_breakout_events(req.symbol,req.timeframe,events); events=await load_breakout_events(req.symbol,req.timeframe,events); settings=await BOT.user_settings(update.effective_user.id)
+            await send_long(q.message,history_text(req.symbol,req.timeframe,events,settings["timezone"])); return
         if data=="settings":
             await q.message.reply_text("Report এবং confirmation mode নির্বাচন করুন:",reply_markup=settings_keyboard()); return
         if data=="myplan":
@@ -1095,10 +1126,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             rid=await BOT.db.fetchval("INSERT INTO subscription_requests(telegram_id,plan_code,days) VALUES($1,$2,$3) RETURNING id",update.effective_user.id,code,days)
             benefit=plan_text("pro")
             await q.message.reply_text(f"✅ Subscription request #{rid} গ্রহণ করা হয়েছে।\n\nআপনি {days} দিনের Pro plan চেয়েছেন। Approval হলে এই সুবিধাগুলো পাবেন:\n\n{benefit}\n\nAdmin review করলে আপনাকে notification দেওয়া হবে।")
-            admin_msg=f"নতুন subscription request #{rid}\nUser: {update.effective_user.id} (@{update.effective_user.username or 'none'})\nPlan: Pro {days} days\nApprove: /approve {update.effective_user.id} {days}"
-            admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
+            approve_cmd=f"/approve {update.effective_user.id} {days}"
+            admin_msg=(f"নতুন subscription request #{rid}\nUser: <code>{update.effective_user.id}</code> (@{html.escape(update.effective_user.username or 'none')})\n"
+                       f"Plan: Pro {days} days\nApprove command:\n<code>{approve_cmd}</code>\n\nMono command-এ tap/hold করে copy করতে পারবেন।")
+            admin_kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept",callback_data=f"admacc|{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"admrej|{rid}")],[InlineKeyboardButton("📋 Copy approve command",copy_text=CopyTextButton(approve_cmd))],[InlineKeyboardButton("👤 User details",callback_data=f"admuser|{update.effective_user.id}")]])
             for admin_id in ADMIN_IDS:
-                try: await context.bot.send_message(admin_id,admin_msg,reply_markup=admin_kb)
+                try: await context.bot.send_message(admin_id,admin_msg,reply_markup=admin_kb,parse_mode=ParseMode.HTML)
                 except Exception: log.warning("Could not notify admin %s",admin_id)
             return
         if parts[0]=="set" and len(parts)==3:
@@ -1128,20 +1161,46 @@ async def risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except ValueError:
         await update.effective_message.reply_text("সব মান positive number হতে হবে এবং entry ও stop আলাদা হতে হবে।")
 
+async def save_breakout_events(symbol: str,timeframe: str,events: list[dict[str,Any]]) -> None:
+    assert BOT is not None
+    if not BOT.db: return
+    for e in events:
+        await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",symbol,timeframe,
+          datetime.fromisoformat(e["time"]),datetime.fromisoformat(e["close_time"]),e["state"],e["level"],e["close"],e["volume_ratio"],e["body_strength"])
+
+
+async def load_breakout_events(symbol: str,timeframe: str,fallback: list[dict[str,Any]]) -> list[dict[str,Any]]:
+    assert BOT is not None
+    if not BOT.db: return fallback
+    rows=await BOT.db.fetch("""SELECT candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength
+      FROM breakout_events WHERE symbol=$1 AND timeframe=$2 ORDER BY candle_close DESC LIMIT 20""",symbol,timeframe)
+    if not rows: return fallback
+    return list(reversed([{"time":r["candle_open"].isoformat(),"close_time":r["candle_close"].isoformat(),"state":r["event_type"],"level":r["level"],"close":r["close_price"],"volume_ratio":r["volume_ratio"] or 0,"body_strength":r["body_strength"] or 0} for r in rows]))
+
+
+def history_text(symbol: str,timeframe: str,events: list[dict[str,Any]],tz_name: str) -> str:
+    from zoneinfo import ZoneInfo
+    tz=ZoneInfo(tz_name); labels={"BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত","BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত","FALSE_BREAKOUT":"ফলস ব্রেকআউট","FALSE_BREAKDOWN":"ফলস ব্রেকডাউন"}
+    lines=[f"📚 {symbol} • {timeframe.upper()} Breakout History",f"সময়: {tz_name} (candle close time)"]
+    for e in events[-10:]:
+        dt=datetime.fromisoformat(e["close_time"]).astimezone(tz)
+        lines.append(f"\n{dt.strftime('%d %b %Y, %I:%M %p')}\n{labels.get(e['state'],e['state'])}\nLevel: {e['level']:.8g} | Volume: {e['volume_ratio']:.2f}x | Body: {e['body_strength']*100:.0f}%")
+    if len(lines)==2: lines.append("\nসাম্প্রতিক qualifying event পাওয়া যায়নি।")
+    lines.append("\nHistory fully closed candle থেকে তৈরি। একই চলমান move বারবার নতুন breakout হিসেবে গণনা করা হয় না।")
+    return "\n".join(lines)
+
+
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not context.args:
         await update.effective_message.reply_text("ব্যবহার: /history SUI 4h"); return
     try:
         req=Request(BOT._normalize_symbol(context.args[0]), BOT._normalize_tf(context.args[1] if len(context.args)>1 else "4h"))
-        frame=await BOT.fetch_candles(req); events=scan_breakout_history(frame)
-        if not events: text="সাম্প্রতিক history-তে qualifying breakout/breakdown পাওয়া যায়নি।"
-        else:
-            lines=[f"📚 {req.symbol} • {req.timeframe} breakout history"]
-            for e in events[-10:]:
-                lines.append(f"\n{e['time'][:16]} — {e['state']}\nLevel {e['level']:.8g} | Volume {e['volume_ratio']:.2f}x | 10-candle follow-through {e['max_follow_through_10_candles_pct']:.2f}%")
-            text="\n".join(lines)+"\n\nPast performance ভবিষ্যৎ ফল নিশ্চিত করে না।"
-        await send_long(update.effective_message,text)
+        frame=await BOT.fetch_candles(req); events=scan_breakout_history(frame,timeframe=req.timeframe)
+        await save_breakout_events(req.symbol,req.timeframe,events); events=await load_breakout_events(req.symbol,req.timeframe,events)
+        settings=await BOT.user_settings(update.effective_user.id)
+        await send_long(update.effective_message,history_text(req.symbol,req.timeframe,events,settings["timezone"]))
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1360,6 +1419,14 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             strong=("CONFIRMED" in event_state and q['breakout']['volume_ratio']>=1.5 and q['breakout']['body_strength']>=.60)
             level=float(retest.get('level') or q['breakout']['bullish_trigger']); fingerprint=event_fingerprint(req.symbol,req.timeframe,candle,event_state,level)
             wanted=(category is not None and row['event_filter']=="all") or row['event_filter']==category or (row['event_filter']=="strict" and strong)
+            # Persist confirmed/false events on every monitor pass. UNIQUE keeps
+            # the three-minute worker from duplicating the same closed candle.
+            persist_type=event_state if event_state in {"BREAKOUT_CONFIRMED","BREAKDOWN_CONFIRMED","FALSE_BREAKOUT_RISK","FALSE_BREAKDOWN_RISK"} else None
+            if persist_type and event_state != row['last_state']:
+                normalized_type=persist_type.replace("_RISK","")
+                opened=frame.index[-1].to_pydatetime(); closed=opened+timeframe_delta(req.timeframe)
+                await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
+                  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",req.symbol,req.timeframe,opened,closed,normalized_type,level,q['last'],q['breakout']['volume_ratio'],q['breakout']['body_strength'])
             if wanted and fingerprint != row['last_fingerprint'] and event_state != row['last_state']:
                 bo=q['breakout']
                 await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {event_state}\nClosed candle: {candle[:16]}\nPrice: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nএটি আর্থিক পরামর্শ নয়।")
