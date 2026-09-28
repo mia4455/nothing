@@ -622,25 +622,37 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
         for zone in result.get("resistance_zones", []):
             ax.axhspan(zone["low"], zone["high"], color="#ff4d5a", alpha=.10)
 
-        # Label every level directly on the chart so a screenshot remains
-        # understandable without reading a separate report.
-        label_x=max(1,len(frame)-3)
-        for idx,level in enumerate(result["supports"],1):
-            ax.annotate(f"S{idx}  {level:.8g}",(label_x,level),xytext=(-4,2),textcoords="offset points",
-                        ha="right",va="bottom",fontsize=8,color="#7CFFB2",
-                        bbox={"boxstyle":"round,pad=.2","facecolor":"#073b24","edgecolor":"#20c878","alpha":.85})
-        for idx,level in enumerate(result["resistances"],1):
-            ax.annotate(f"R{idx}  {level:.8g}",(label_x,level),xytext=(-4,2),textcoords="offset points",
-                        ha="right",va="bottom",fontsize=8,color="#FFD0D3",
-                        bbox={"boxstyle":"round,pad=.2","facecolor":"#4b1118","edgecolor":"#ff4d5a","alpha":.85})
-
+        # Put labels in a dedicated right-hand column. Their displayed Y
+        # positions are collision-resolved, while arrows point to exact prices.
         last=frame.iloc[-1]; last_close=float(last.Close)
         ax.axhline(last_close,color="#f5e663",linewidth=.9,linestyle=":",alpha=.9)
-        ax.annotate(f"LAST  {last_close:.8g}",(label_x,last_close),xytext=(-4,-12),textcoords="offset points",
-                    ha="right",fontsize=8,color="#fff59d",bbox={"boxstyle":"round,pad=.2","facecolor":"#4b4510","alpha":.85})
         bo=result["quant"]["breakout"]
         ax.axhline(bo["bullish_trigger"],color="#40c4ff",linewidth=1.0,linestyle="--",alpha=.75)
         ax.axhline(bo["bearish_trigger"],color="#ffab40",linewidth=1.0,linestyle="--",alpha=.75)
+
+        labels=[]
+        for idx,level in enumerate(result["supports"],1): labels.append({"text":f"S{idx}  {level:.8g}","actual":float(level),"color":"#7CFFB2","face":"#073b24","edge":"#20c878"})
+        for idx,level in enumerate(result["resistances"],1): labels.append({"text":f"R{idx}  {level:.8g}","actual":float(level),"color":"#FFD0D3","face":"#4b1118","edge":"#ff4d5a"})
+        labels.append({"text":f"LAST  {last_close:.8g}","actual":last_close,"color":"#fff59d","face":"#4b4510","edge":"#f5e663"})
+        all_prices=[float(frame.Low.min()),float(frame.High.max())]+[x["actual"] for x in labels]
+        ymin,ymax=min(all_prices),max(all_prices); span=max(ymax-ymin,abs(last_close)*.01,1e-9)
+        floor,ceiling=ymin-span*.02,ymax+span*.02; gap=span*.037
+        ordered=sorted(labels,key=lambda x:x["actual"])
+        display=[]
+        for item in ordered: display.append(max(item["actual"],display[-1]+gap if display else floor))
+        if display and display[-1]>ceiling:
+            shift=display[-1]-ceiling; display=[y-shift for y in display]
+            for i in range(len(display)-2,-1,-1): display[i]=min(display[i],display[i+1]-gap)
+        ax.set_ylim(min(floor,display[0]-gap if display else floor),max(ceiling,display[-1]+gap if display else ceiling))
+        label_x=len(frame)+13; anchor_x=len(frame)-1
+        ax.set_xlim(-2,len(frame)+18)
+        # Keep volume panel horizontally aligned with the price panel.
+        for candidate in axes[1:]: candidate.set_xlim(-2,len(frame)+18)
+        for item,ytext in zip(ordered,display):
+            ax.annotate(item["text"],xy=(anchor_x,item["actual"]),xytext=(label_x,ytext),textcoords="data",
+                        ha="right",va="center",fontsize=8,color=item["color"],clip_on=False,
+                        arrowprops={"arrowstyle":"-","color":item["edge"],"lw":.8,"alpha":.8},
+                        bbox={"boxstyle":"round,pad=.22","facecolor":item["face"],"edgecolor":item["edge"],"alpha":.92})
 
         for n, line in enumerate(result["trendlines"], 1):
             ax.plot([line["start_idx"], line["end_idx"]], [line["start_val"], line["end_val"]], color="#42a5f5", linewidth=1.6, linestyle="--", label="Trendline" if n == 1 else None)
@@ -651,7 +663,7 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
         ax.legend(loc="upper left",fontsize=8,ncol=2)
         ohlc=(f"Latest closed candle\nO {float(last.Open):.8g}   H {float(last.High):.8g}\n"
               f"L {float(last.Low):.8g}   C {float(last.Close):.8g}")
-        ax.text(.99,.02,ohlc,transform=ax.transAxes,ha="right",va="bottom",fontsize=8,color="white",
+        ax.text(.01,.02,ohlc,transform=ax.transAxes,ha="left",va="bottom",fontsize=8,color="white",
                 bbox={"boxstyle":"round,pad=.35","facecolor":"#111827","edgecolor":"#94a3b8","alpha":.88})
         buffer = io.BytesIO()
         fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -742,6 +754,7 @@ GUIDE_DETAILS={
  "professional":"Advanced indicators, BOS/CHoCH, liquidity sweep, FVG, order block, volume profile, futures/news ও market filter।",
  "timezone":"/timezone Asia/Dhaka। Valid IANA timezone দিলে user setting database-এ save হবে।",
  "language":"Settings থেকে বাংলা বা English নির্বাচন করা যায়। Technical labels পরিচিত English terms-এ থাকতে পারে।",
+ "watchlist_help":"Watchlist হলো আপনার পছন্দের coin-এর সংরক্ষিত তালিকা। /watchlist SUI দিয়ে যোগ করুন, /watchlist_remove SUI দিয়ে বাদ দিন। Watchlist নিজে alert পাঠায় না। Breakout/breakdown notification পেতে /monitor SUI 4h চালু করুন। /watchlist message-এর Stop button অথবা /delete_alert ID দিয়ে monitoring বন্ধ করুন।",
 }
 
 
@@ -1037,6 +1050,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text(detail,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← মূল Guide",callback_data="guidehome")]])); return
         if parts[0]=="an" and len(parts)==3:
             await run_request(update,Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]))); return
+        if parts[0]=="wlrm" and len(parts)==2:
+            symbol=BOT._normalize_symbol(parts[1]); await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1 AND symbol=$2",update.effective_user.id,symbol)
+            await q.message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে। /watchlist দিয়ে নতুন তালিকা দেখুন।"); return
+        if parts[0]=="aloff" and len(parts)==2 and parts[1].isdigit():
+            await BOT.db.execute("UPDATE alerts SET active=FALSE WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
+            await q.message.reply_text(f"✅ Monitoring #{parts[1]} বন্ধ করা হয়েছে। /watchlist দিয়ে নতুন তালিকা দেখুন।"); return
         if parts[0]=="al" and len(parts)==3:
             if not BOT.db: await q.message.reply_text("Alert-এর জন্য DATABASE_URL সেট করুন।"); return
             await BOT.ensure_user(update); symbol=BOT._normalize_symbol(parts[1]); tf=BOT._normalize_tf(parts[2])
@@ -1185,8 +1204,30 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     monitors=await BOT.db.fetch("SELECT id,symbol,timeframe,event_filter FROM alerts WHERE telegram_id=$1 AND active ORDER BY id",update.effective_user.id)
     watch="\n".join(f"• {r['symbol']}" for r in rows) or "খালি"
     active="\n".join(f"• #{r['id']} {r['symbol']} {r['timeframe']} — {r['event_filter']}" for r in monitors) or "কোনো monitoring চালু নেই"
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("Active Alerts",callback_data="guide|alerts")]])
-    await update.effective_message.reply_text(f"⭐ Watchlist\n{watch}\n\n📡 চলমান Monitoring\n{active}\n\nযোগ: /watchlist SUI\nStrong monitor: /monitor SUI 4h\nবন্ধ: /delete_alert ID",reply_markup=kb)
+    buttons=[]
+    for r in rows:
+        base=r['symbol'].split('/')[0]
+        buttons.append([InlineKeyboardButton(f"📊 {r['symbol']}",callback_data=f"an|{base}|4h"),InlineKeyboardButton("❌ Remove",callback_data=f"wlrm|{base}")])
+    for r in monitors:
+        buttons.append([InlineKeyboardButton(f"📡 #{r['id']} {r['symbol']} {r['timeframe']}",callback_data=f"an|{r['symbol'].split('/')[0]}|{r['timeframe']}"),InlineKeyboardButton("⏹ Stop",callback_data=f"aloff|{r['id']}")])
+    buttons.append([InlineKeyboardButton("Guide: Watchlist কীভাবে কাজ করে",callback_data="gitem|watchlist_help")])
+    kb=InlineKeyboardMarkup(buttons)
+    await update.effective_message.reply_text(f"⭐ Watchlist\n{watch}\n\n📡 চলমান Monitoring\n{active}\n\nWatchlist শুধু coin save করে; এটি নিজে notification দেয় না। Notification পেতে /monitor SUI 4h চালু করুন।\n\nযোগ: /watchlist SUI\nবাদ: /watchlist_remove SUI\nসব বাদ: /watchlist_clear\nMonitor বন্ধ: /delete_alert ID",reply_markup=kb)
+
+async def watchlist_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    if not context.args: await update.effective_message.reply_text("ব্যবহার: /watchlist_remove SUI"); return
+    try: symbol=BOT._normalize_symbol(context.args[0])
+    except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
+    result=await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1 AND symbol=$2",update.effective_user.id,symbol)
+    await update.effective_message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে।" if result.endswith("1") else f"{symbol} watchlist-এ ছিল না।")
+
+async def watchlist_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context; assert BOT is not None
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    result=await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1",update.effective_user.id)
+    await update.effective_message.reply_text(f"✅ Watchlist পরিষ্কার করা হয়েছে ({result.split()[-1]}টি coin)। চলমান monitors আলাদাভাবে active থাকবে; /alerts থেকে বন্ধ করুন।")
 
 async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Create persistent strong-confirmation breakout/breakdown monitoring."""
@@ -1355,6 +1396,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","ব্যবহার নির্দেশিকা"),BotCommand("subscribe","Packages ও approval")]
 PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive guide"),BotCommand("settings","Report settings"),
  BotCommand("monitor","Strong breakout monitor"),BotCommand("alerts","Active monitors"),BotCommand("watchlist","Watchlist ও monitoring"),
+ BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
  BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("backtest","Backtest"),
  BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("risk","Position size")]
 ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("admin","Admin panel"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
@@ -1416,6 +1458,8 @@ def main() -> None:
     app.add_handler(CommandHandler("trades", protected(trades_command)))
     app.add_handler(CommandHandler("delete_alert", protected(delete_alert_command)))
     app.add_handler(CommandHandler("watchlist", protected(watchlist_command)))
+    app.add_handler(CommandHandler("watchlist_remove", protected(watchlist_remove_command)))
+    app.add_handler(CommandHandler("watchlist_clear", protected(watchlist_clear_command)))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("stats", admin_stats_command))
     app.add_handler(CommandHandler("approve", approve_command))
