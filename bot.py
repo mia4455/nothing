@@ -553,7 +553,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         except Exception as exc:
             log.warning("Market filter unavailable: %s",exc); return {}
 
-    async def analyze(self, request: Request, frame: pd.DataFrame) -> dict[str, Any]:
+    async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard") -> dict[str, Any]:
         quant = quant_snapshot(frame)
         context, higher, market = await asyncio.gather(self.external_context(request), self.higher_timeframe(request), self.market_filter(request.timeframe))
         quant["retest"]=retest_state(frame,quant["breakout"])
@@ -566,7 +566,14 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         ]
         supports = [z["price"] for z in quant["supports"]]
         resistances = [z["price"] for z in quant["resistances"]]
+        detail_instruction = {
+            "quick": "Give a compact report of at most 10 short lines.",
+            "standard": "Give a clear medium-detail report with titled sections and practical explanations.",
+            "professional": "Give a comprehensive professional report. Explain every important metric, S1-S3, R1-R3, market structure, BOS/CHoCH, liquidity, momentum, volume, volatility, multi-timeframe context, futures/news context, bullish and bearish scenarios, confirmation, invalidation, false-breakout risk and a concise conclusion. Do not omit sections merely to be brief.",
+        }.get(detail_mode, "Give a clear medium-detail report.")
         prompt = f"""Analyze {request.symbol} on {request.timeframe}. Python has already calculated the authoritative metrics below.
+The user request was: {json.dumps(request.transcript, ensure_ascii=False)}
+Requested report mode: {detail_mode}. {detail_instruction}
 Do not replace or recalculate these levels. Explain structure, RSI, MACD, EMAs, Bollinger position, volume, S1-S3/R1-R3, invalidation and two conditional scenarios in Bengali. Include an educational risk warning.
 QUANT: {json.dumps(quant, separators=(',', ':'))}
 HIGHER_TIMEFRAME: {json.dumps(higher, separators=(',', ':'))}
@@ -614,10 +621,38 @@ Return supports={supports}, resistances={resistances}, trendlines={quant['trendl
             ax.axhspan(zone["low"], zone["high"], color="#20c878", alpha=.10)
         for zone in result.get("resistance_zones", []):
             ax.axhspan(zone["low"], zone["high"], color="#ff4d5a", alpha=.10)
+
+        # Label every level directly on the chart so a screenshot remains
+        # understandable without reading a separate report.
+        label_x=max(1,len(frame)-3)
+        for idx,level in enumerate(result["supports"],1):
+            ax.annotate(f"S{idx}  {level:.8g}",(label_x,level),xytext=(-4,2),textcoords="offset points",
+                        ha="right",va="bottom",fontsize=8,color="#7CFFB2",
+                        bbox={"boxstyle":"round,pad=.2","facecolor":"#073b24","edgecolor":"#20c878","alpha":.85})
+        for idx,level in enumerate(result["resistances"],1):
+            ax.annotate(f"R{idx}  {level:.8g}",(label_x,level),xytext=(-4,2),textcoords="offset points",
+                        ha="right",va="bottom",fontsize=8,color="#FFD0D3",
+                        bbox={"boxstyle":"round,pad=.2","facecolor":"#4b1118","edgecolor":"#ff4d5a","alpha":.85})
+
+        last=frame.iloc[-1]; last_close=float(last.Close)
+        ax.axhline(last_close,color="#f5e663",linewidth=.9,linestyle=":",alpha=.9)
+        ax.annotate(f"LAST  {last_close:.8g}",(label_x,last_close),xytext=(-4,-12),textcoords="offset points",
+                    ha="right",fontsize=8,color="#fff59d",bbox={"boxstyle":"round,pad=.2","facecolor":"#4b4510","alpha":.85})
+        bo=result["quant"]["breakout"]
+        ax.axhline(bo["bullish_trigger"],color="#40c4ff",linewidth=1.0,linestyle="--",alpha=.75)
+        ax.axhline(bo["bearish_trigger"],color="#ffab40",linewidth=1.0,linestyle="--",alpha=.75)
+
         for n, line in enumerate(result["trendlines"], 1):
             ax.plot([line["start_idx"], line["end_idx"]], [line["start_val"], line["end_val"]], color="#42a5f5", linewidth=1.6, linestyle="--", label="Trendline" if n == 1 else None)
-        if result["trendlines"]:
-            ax.legend(loc="upper left")
+        # Legend and exact latest closed-candle OHLC values.
+        ax.plot([],[],color="#42a5f5",label="EMA20")
+        ax.plot([],[],color="#ffb300",label="EMA50")
+        ax.plot([],[],color="#ab47bc",label="EMA200")
+        ax.legend(loc="upper left",fontsize=8,ncol=2)
+        ohlc=(f"Latest closed candle\nO {float(last.Open):.8g}   H {float(last.High):.8g}\n"
+              f"L {float(last.Low):.8g}   C {float(last.Close):.8g}")
+        ax.text(.99,.02,ohlc,transform=ax.transAxes,ha="right",va="bottom",fontsize=8,color="white",
+                bbox={"boxstyle":"round,pad=.35","facecolor":"#111827","edgecolor":"#94a3b8","alpha":.88})
         buffer = io.BytesIO()
         fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
@@ -830,6 +865,16 @@ def apply_confirmation_mode(result: dict[str,Any], mode: str) -> None:
     b["confirmation_mode"]=mode; b["confirmation_rule"]=f"volume >= {volume_req:.2f}x, body >= {body_req*100:.0f}%, closed candle"+(" + higher-timeframe alignment" if mode=="conservative" else "")
 
 
+def requested_detail_mode(prompt: str, saved_mode: str) -> str:
+    """An explicit natural-language request overrides the saved default."""
+    text=(prompt or "").lower()
+    detailed=("বিস্তারিত","ডিটেইল","সম্পূর্ণ","সবকিছু","গভীর","professional","detailed","detail","full analysis","deep analysis")
+    brief=("সংক্ষেপে","শর্ট","ছোট করে","quick","brief","short answer")
+    if any(word in text for word in detailed): return "professional"
+    if any(word in text for word in brief): return "quick"
+    return saved_mode
+
+
 def quick_report(request: Request, result: dict[str,Any]) -> str:
     q=result["quant"]; b=q["breakout"]
     return (f"{request.symbol} — {request.timeframe}\n\n"
@@ -848,10 +893,11 @@ async def run_request(update: Update, request: Request) -> None:
         async with BOT.semaphore:
             await message.chat.send_action(ChatAction.TYPING)
             frame = await BOT.fetch_candles(request)
-            result = await BOT.analyze(request, frame)
             settings=await BOT.user_settings(update.effective_user.id if update.effective_user else None)
+            detail_mode=requested_detail_mode(request.transcript,settings["detail_mode"])
+            result = await BOT.analyze(request, frame, detail_mode=detail_mode)
             apply_confirmation_mode(result,settings["risk_mode"])
-            if settings["detail_mode"]=="quick":
+            if detail_mode=="quick":
                 result["analysis_bn"]=quick_report(request,result)
             if BOT.db and update.effective_user:
                 await BOT.ensure_user(update)
