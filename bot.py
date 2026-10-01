@@ -566,7 +566,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         self.cache.set(cache_key,frame.copy(deep=True),ttl)
         return frame
 
-    async def external_context(self, request: Request) -> dict[str, Any]:
+    async def external_context(self, request: Request, all_market: bool = False) -> dict[str, Any]:
         """Best-effort public futures context and reputable RSS headlines.
 
         Failure never blocks technical analysis. Headlines are clearly treated
@@ -588,14 +588,23 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
                 )
                 if isinstance(futures[0], dict): context["funding_rate"] = float(futures[0].get("lastFundingRate", 0))
                 if isinstance(futures[1], dict): context["open_interest"] = float(futures[1].get("openInterest", 0))
-                feeds = ["https://www.coindesk.com/arc/outboundfeeds/rss/", "https://cointelegraph.com/rss"]
-                payloads = await asyncio.gather(*(session.get(url) for url in feeds), return_exceptions=True)
+                # Multiple independent, free RSS desks improve recency and coin coverage.
+                # A failed/paywalled source is ignored and never blocks the analysis.
+                feeds={
+                    "CoinDesk":"https://www.coindesk.com/arc/outboundfeeds/rss/",
+                    "Cointelegraph":"https://cointelegraph.com/rss",
+                    "Decrypt":"https://decrypt.co/feed",
+                    "CryptoSlate":"https://cryptoslate.com/feed/",
+                    "The Block":"https://www.theblock.co/rss.xml",
+                    "CryptoPotato":"https://cryptopotato.com/feed/",
+                }
+                payloads = await asyncio.gather(*(session.get(url) for url in feeds.values()), return_exceptions=True)
                 entries=[]
-                for url,response in zip(feeds,payloads):
+                for (source,url),response in zip(feeds.items(),payloads):
                     if isinstance(response, Exception): continue
                     try:
-                        raw = await response.read(); source="CoinDesk" if "coindesk" in url else "Cointelegraph"
-                        entries.extend((source,item) for item in feedparser.parse(raw).entries[:15])
+                        raw = await response.read()
+                        entries.extend((source,item) for item in feedparser.parse(raw).entries[:20])
                     finally: response.release()
                 base = request.symbol.split("/")[0].lower()
                 aliases={"btc":{"btc","bitcoin"},"eth":{"eth","ethereum"},"bnb":{"bnb","binance coin","binance"},"sui":{"sui"},"sei":{"sei"},"sol":{"sol","solana"}}
@@ -611,11 +620,19 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
                         age_hours=max(0,(now-dt.astimezone(timezone.utc)).total_seconds()/3600)
                     except Exception: pass
                     if age_hours is not None and age_hours>168: continue
-                    record={"title":title[:240],"link":str(item.get("link", ""))[:500],"published":published_raw[:80] or "unknown","age_hours":round(age_hours,1) if age_hours is not None else None,"source":source}
-                    if any(term in hay for term in coin_terms): coin_news.append(record); seen.add(title.lower())
+                    # Preserve a short feed synopsis for concise news cards; never
+                    # copy the full article into Telegram.
+                    synopsis=re.sub(r"\s+"," ",summary).strip()
+                    record={"title":title[:240],"summary":synopsis[:500],"link":str(item.get("link", ""))[:500],"published":published_raw[:80] or "unknown","age_hours":round(age_hours,1) if age_hours is not None else None,"source":source}
+                    if all_market:
+                        global_news.append(record); seen.add(title.lower())
+                    elif any(term in hay for term in coin_terms): coin_news.append(record); seen.add(title.lower())
                     elif any(term in hay for term in global_terms): global_news.append(record); seen.add(title.lower())
-                context["news"]=(coin_news[:4]+global_news[:2])[:6]
-                context["news_scope"]={"coin_specific":len(coin_news[:4]),"global_market":len(global_news[:2])}
+                # Put coin-specific and newest stories first while retaining broad context.
+                coin_news.sort(key=lambda x: x["age_hours"] if x["age_hours"] is not None else 99999)
+                global_news.sort(key=lambda x: x["age_hours"] if x["age_hours"] is not None else 99999)
+                context["news"]=(coin_news[:8]+global_news[:4])[:12]
+                context["news_scope"]={"coin_specific":len(coin_news[:8]),"global_market":len(global_news[:4]),"sources_checked":len(feeds)}
                 context["news_status"] = "live_rss" if context["news"] else "no_relevant_headlines"
         except Exception as exc:
             log.warning("External context unavailable: %s", exc)
@@ -1099,9 +1116,38 @@ async def run_request(update: Update, request: Request) -> None:
         except BadRequest:
             pass
 
+async def market_cap_answer(message: Message,text: str) -> None:
+    """Answer coin market-cap/dominance questions from free CoinGecko data."""
+    assert BOT is not None
+    try:
+        req=await BOT.parse_text(text); ticker=req.symbol.split("/")[0].lower()
+        timeout=aiohttp.ClientTimeout(total=12); headers={"User-Agent":"CryptoAnalystBot/1.0"}
+        async with aiohttp.ClientSession(timeout=timeout,headers=headers) as session:
+            async with session.get("https://api.coingecko.com/api/v3/search",params={"query":ticker}) as r:
+                r.raise_for_status(); matches=(await r.json()).get("coins",[])
+            candidates=[c for c in matches if str(c.get("symbol","")).lower()==ticker]
+            if not candidates: raise UserInputError(f"{ticker.upper()} CoinGecko-তে পাওয়া যায়নি।")
+            coin=sorted(candidates,key=lambda c: c.get("market_cap_rank") or 10**9)[0]
+            async with session.get("https://api.coingecko.com/api/v3/coins/markets",params={"vs_currency":"usd","ids":coin["id"],"sparkline":"false"}) as r:
+                r.raise_for_status(); rows=await r.json()
+            async with session.get("https://api.coingecko.com/api/v3/global") as r:
+                r.raise_for_status(); global_data=(await r.json()).get("data",{})
+        if not rows: raise UserInputError("Market-cap data পাওয়া যায়নি।")
+        row=rows[0]; cap=float(row.get("market_cap") or 0); total=float(global_data.get("total_market_cap",{}).get("usd") or 0)
+        dominance=(cap/total*100) if cap and total else None
+        price=row.get("current_price"); rank=row.get("market_cap_rank") or coin.get("market_cap_rank") or "?"
+        dom_text=f"{dominance:.4f}%" if dominance is not None else "unavailable"
+        await message.reply_text(f"{row.get('name',ticker.upper())} ({ticker.upper()})\n\nMarket cap: ${cap:,.0f}\nGlobal dominance: {dom_text}\nMarket-cap rank: #{rank}\nPrice: ${float(price):,.8g}" if price is not None else f"{ticker.upper()}\nMarket cap: ${cap:,.0f}\nGlobal dominance: {dom_text}\nRank: #{rank}")
+    except UserInputError as exc: await message.reply_text(f"⚠️ {exc}")
+    except Exception as exc:
+        log.warning("CoinGecko market-cap lookup failed: %s",exc)
+        await message.reply_text("⚠️ Market cap/dominance data এখন পাওয়া যাচ্ছে না। কিছুক্ষণ পরে চেষ্টা করুন।")
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     text=update.effective_message.text.lower()
+    if any(x in text for x in ("dominance","ডমিনেন্স","ডমিন্যান্স","market cap","marketcap","মার্কেট ক্যাপ")):
+        await market_cap_answer(update.effective_message,update.effective_message.text); return
     if any(x in text for x in ("খবর","নিউজ","news","মিটিং","meeting","প্রোগ্রাম","program","event","ইভেন্ট","ভাষণ","speech")):
         generic=any(x in text for x in ("পুরো ক্রিপ্টো","crypto market","সব খবর","all crypto"))
         if generic: context.args=["all"]
@@ -1225,6 +1271,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text(detail,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← মূল Guide",callback_data="guidehome")]])); return
         if parts[0]=="an" and len(parts)==3:
             await run_request(update,Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]))); return
+        if parts[0]=="scanpage" and len(parts)==3:
+            tf=BOT._normalize_tf(parts[1]); page=int(parts[2]); uid=update.effective_user.id
+            results=BOT.cache.get(f"scanner:{uid}:{tf}")
+            if not results:
+                await q.answer("Scanner cache শেষ হয়েছে—আবার Scanner চালান।",show_alert=True); return
+            text,keyboard=scanner_page(results,tf,page)
+            await q.edit_message_text(text,reply_markup=keyboard); return
         if parts[0]=="pine" and len(parts)==3:
             symbol=BOT._normalize_symbol(parts[1]); tf=BOT._normalize_tf(parts[2]); uid=update.effective_user.id
             key=f"pine:{uid}:{symbol}:{tf}"; script=BOT.cache.get(key)
@@ -1500,8 +1553,50 @@ async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text="\n\n".join(f"#{r['id']} {r['symbol']} {r['timeframe']} {r['direction'].upper()}\nEntry {r['entry']:.8g} | SL {r['stop']:.8g} | TP {r['target']:.8g}\nStatus: {r['status']}" for r in rows) or "কোনো paper trade নেই।"
     await send_long(update.effective_message,text)
 
+def news_market_hint(item: dict[str,Any]) -> tuple[str,str]:
+    """Conservative keyword hint; it is context, never a price prediction."""
+    text=(str(item.get("title",""))+" "+str(item.get("summary",""))).lower()
+    bullish=("approval","approved","adoption","launch","partnership","inflow","surge","rally","record high","upgrade","buy","bullish","growth","recover","integration")
+    bearish=("hack","exploit","lawsuit","ban ","banned","outflow","crash","sell-off","liquidation","fraud","charges","bearish","shutdown","breach","decline")
+    up=sum(word in text for word in bullish); down=sum(word in text for word in bearish)
+    if up>down: return "BULLISH 🟢","ইতিবাচক adoption/চাহিদা বা market confidence-এর ইঙ্গিত দেয়।"
+    if down>up: return "BEARISH 🔴","ঝুঁকি, বিক্রির চাপ বা market confidence দুর্বল হওয়ার ইঙ্গিত দেয়।"
+    return "NEUTRAL 🟡","তাৎক্ষণিকভাবে পরিষ্কার bullish বা bearish দিক নিশ্চিত করে না।"
+
+
+def concise_news_point(item: dict[str,Any]) -> str:
+    """Return one concise main-point sentence from RSS title/synopsis."""
+    title=re.sub(r"\s+"," ",str(item.get("title","")).strip()).rstrip(".!?।")
+    summary=re.sub(r"\s+"," ",str(item.get("summary","")).strip())
+    first=re.split(r"(?<=[.!?।])\s+",summary,1)[0].strip() if summary else ""
+    point=first if first and len(first)>=35 else title
+    if len(point)>320: point=point[:317].rsplit(" ",1)[0]+"…"
+    return point if point.endswith((".","!","?","।","…")) else point+"।"
+
+
+async def send_news_cards(message: Any,news: list[dict[str,Any]]) -> None:
+    """Send concise HTML cards with a clickable source and market hint."""
+    cards=[]
+    for i,item in enumerate(news,1):
+        hint,meaning=news_market_hint(item); link=str(item.get("link","")).strip()
+        source=html.escape(str(item.get("source","Source"))); point=html.escape(concise_news_point(item)); meaning=html.escape(meaning)
+        source_line=f'🌐 Source: <a href="{html.escape(link,quote=True)}">Click Here</a>' if link.startswith(("http://","https://")) else f"🌐 Source: {source}"
+        cards.append(f"📰 <b>{i}. মূল কথা</b>\n{point}\n\n📊 <b>Market Hint: {hint}</b>\n{meaning}\n\n{source_line}\n<i>{source} • {item.get('age_hours','?')}h ago</i>")
+    if not cards:
+        await message.reply_text("প্রাসঙ্গিক fresh RSS news পাওয়া যায়নি।"); return
+    # Keep each HTML message safely below Telegram's entity/message limit.
+    batch=""
+    for card in cards:
+        candidate=(batch+"\n\n"+card).strip()
+        if len(candidate)>3800 and batch:
+            await message.reply_text(batch,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+            batch=card
+        else: batch=candidate
+    if batch: await message.reply_text(batch,parse_mode=ParseMode.HTML,disable_web_page_preview=True)
+
+
 async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show upcoming admin-curated events plus fresh free RSS headlines."""
+    """Show upcoming admin-curated events plus concise fresh RSS news cards."""
     assert BOT is not None
     raw=context.args[0] if context.args else "BTC"
     all_market=raw.lower() in {"all","crypto","market","সব"}
@@ -1512,19 +1607,17 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if BOT.db:
         if symbol: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() AND (symbol=$1 OR symbol='ALL') ORDER BY starts_at LIMIT 20",symbol)
         else: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() ORDER BY starts_at LIMIT 20")
-    request=Request(symbol or "BTC/USDT","4h"); context_data=await BOT.external_context(request)
+    request=Request(symbol or "BTC/USDT","4h"); context_data=await BOT.external_context(request,all_market=all_market)
     lines=[f"Upcoming Crypto Events — {symbol or 'All Market'}",f"সময়: {settings['timezone']}"]
     if rows:
         for r in rows:
             local=r['starts_at'].astimezone(tz); lines.append(f"\n#{r['id']} • {r['impact'].upper()}\n{local.strftime('%d %b %Y, %I:%M %p')}\n{r['symbol']} — {r['title']}"+(f"\n{r['source_url']}" if r['source_url'] else ""))
     else: lines.append("\nDatabase-এ আসন্ন নির্ধারিত event পাওয়া যায়নি।")
     news=context_data.get("news",[])
-    lines.append("\nসাম্প্রতিক RSS News")
-    if news:
-        for n in news[:6]: lines.append(f"\n• {n['title']}\nSource: {n.get('source','Unknown')} | Age: {n.get('age_hours','?')}h\n{n.get('link','')}")
-    else: lines.append("\nপ্রাসঙ্গিক fresh RSS headline পাওয়া যায়নি।")
-    lines.append("\nনির্ধারিত event admin-curated; RSS headline independently fact-checked নয়।")
+    lines.append("\nনিচে সর্বশেষ news-এর সংক্ষিপ্ত মূল কথা ও market hint দেওয়া হয়েছে।")
+    lines.append("Market Hint শিক্ষামূলক sentiment context; এটি price prediction নয়। RSS headline independently fact-checked নয়।")
     await send_long(update.effective_message,"\n".join(lines))
+    await send_news_cards(update.effective_message,news[:12])
     if rows:
         kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"⏰ Remind me — #{r['id']} {r['symbol']}",callback_data=f"evrem|{r['id']}")] for r in rows[:10]])
         await update.effective_message.reply_text("Event reminder নির্বাচন করুন। ২৪ ঘণ্টা, ১ ঘণ্টা ও ১০ মিনিট আগে notification যাবে।",reply_markup=kb)
@@ -1576,36 +1669,53 @@ async def performance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     net_r=wins*2-losses; win_rate=wins/total*100
     await update.effective_message.reply_text(f"Paper Trade Performance\n\nClosed trades: {total}\nTargets hit: {wins}\nStops hit: {losses}\nWin rate: {win_rate:.1f}%\nApprox net: {net_r:.1f}R\n\nDefault approximation 2R target ধরে; এটি real P/L নয়।")
 
+def scanner_page(results: list[Any],tf: str,page: int) -> tuple[str,InlineKeyboardMarkup]:
+    """Render ten scanner rows; callbacks edit this same Telegram message."""
+    page=max(0,min(page,max(0,(len(results)-1)//10))); start=page*10; chunk=results[start:start+10]
+    lines=[f"Market Scanner — {tf.upper()}",f"পৃষ্ঠা {page+1}/{max(1,(len(results)+9)//10)} • ফলাফল {start+1}–{start+len(chunk)} of {len(results)}"]
+    for i,(_,symbol,b) in enumerate(chunk,start+1):
+        distance=min(abs(b["distance_to_bullish_pct"]),abs(b["distance_to_bearish_pct"]))
+        lines.append(f"\n{i}. {symbol}\n{b['state']} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x | trigger দূরত্ব {distance:.2f}%\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
+    lines.append("\nScore probability নয়। Data শেষ closed candle-এর।")
+    buttons=[]
+    if page>0: buttons.append(InlineKeyboardButton("◀️ Previous",callback_data=f"scanpage|{tf}|{page-1}"))
+    if start+10<len(results): buttons.append(InlineKeyboardButton("Next ▶️",callback_data=f"scanpage|{tf}|{page+1}"))
+    return "\n".join(lines),InlineKeyboardMarkup([buttons])
+
 async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if await BOT.effective_plan(update.effective_user.id) not in {"pro","admin"}:
         await update.effective_message.reply_text("Market scanner Pro feature। সুবিধা দেখতে /subscribe পাঠান।"); return
     tf=BOT._normalize_tf(context.args[0] if context.args else "4h")
-    status=await update.effective_message.reply_text("Top-volume market scan চলছে…")
+    status=await update.effective_message.reply_text("Top-volume 60টি market scan চলছে…")
     try:
         if not BOT.markets_loaded: await BOT.exchange.load_markets(); BOT.markets_loaded=True
-        tickers=await BOT.exchange.fetch_tickers()
-        candidates=[]
+        tickers=await BOT.exchange.fetch_tickers(); candidates=[]
+        excluded={"USDC/USDT","FDUSD/USDT","TUSD/USDT","USDP/USDT","DAI/USDT"}
         for symbol,t in tickers.items():
             m=BOT.exchange.markets.get(symbol,{})
-            if symbol.endswith("/USDT") and m.get("spot") and m.get("active",True) and symbol not in {"USDC/USDT","FDUSD/USDT","TUSD/USDT"}:
+            if symbol.endswith("/USDT") and m.get("spot") and m.get("active",True) and symbol not in excluded:
                 candidates.append((float(t.get("quoteVolume") or 0),symbol))
-        symbols=[s for _,s in sorted(candidates,reverse=True)[:25]]
-        sem=asyncio.Semaphore(5)
+        # Scan enough liquid pairs to retain 60 even if a few endpoints fail.
+        symbols=[s for _,s in sorted(candidates,reverse=True)[:70]]
+        sem=asyncio.Semaphore(6)
         async def scan(symbol):
             async with sem:
                 f=await BOT.fetch_candles(Request(symbol,tf)); q=quant_snapshot(f); b=q["breakout"]
                 distance=min(abs(b["distance_to_bullish_pct"]),abs(b["distance_to_bearish_pct"]))
-                rank=b["bullish_setup_score"]+(10 if b["squeeze"] else 0)-min(distance,10)
+                direction_score=max(b["bullish_setup_score"],b["bearish_setup_score"])
+                rank=direction_score+(10 if b["squeeze"] else 0)-min(distance,10)
                 return rank,symbol,b
-        results=await asyncio.gather(*(scan(s) for s in symbols),return_exceptions=True)
-        valid=sorted((x for x in results if not isinstance(x,Exception)),reverse=True)[:10]
-        lines=[f"Market Scanner — {tf}"]
-        for i,(rank,symbol,b) in enumerate(valid,1): lines.append(f"\n{i}. {symbol}\n{b['state']} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
-        await send_long(update.effective_message,"\n".join(lines)+"\n\nScore probability নয়।")
-    finally:
+        scanned=await asyncio.gather(*(scan(s) for s in symbols),return_exceptions=True)
+        valid=sorted((x for x in scanned if not isinstance(x,Exception)),reverse=True)[:60]
+        if not valid: raise UserInputError("Scanner data পাওয়া যায়নি। কিছুক্ষণ পরে চেষ্টা করুন।")
+        BOT.cache.set(f"scanner:{update.effective_user.id}:{tf}",valid,ttl=600)
+        text,keyboard=scanner_page(valid,tf,0)
+        await status.edit_text(text,reply_markup=keyboard)
+    except Exception:
         try: await status.delete()
         except BadRequest: pass
+        raise
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
