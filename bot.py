@@ -984,7 +984,8 @@ def colored_state(state: str, bengali: bool = False) -> str:
         "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউন ঝুঁকি" if bengali else "FALSE_BREAKDOWN_RISK",
     }
     label=labels.get(state,state.replace("_"," ").title())
-    if state=="INSIDE_RANGE": icon="🟡"
+    if "FALSE" in state: icon="🟠"
+    elif state=="INSIDE_RANGE": icon="🟡"
     elif "BREAKDOWN" in state: icon="🔴"
     elif "BREAKOUT" in state: icon="🟢"
     else: icon="⚪"
