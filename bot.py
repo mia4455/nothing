@@ -970,6 +970,27 @@ def tradingview_url(symbol: str,timeframe: str) -> str:
     return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{ticker}&interval={tradingview_interval(timeframe)}"
 
 
+def colored_state(state: str, bengali: bool = False) -> str:
+    """Telegram cannot color arbitrary text; standard colored emoji work for every user."""
+    labels={
+        "INSIDE_RANGE":"ইনসাইড রেঞ্জ" if bengali else "INSIDE_RANGE",
+        "APPROACHING_BREAKOUT":"ব্রেকআউটের কাছাকাছি" if bengali else "APPROACHING_BREAKOUT",
+        "BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত" if bengali else "BREAKOUT_CONFIRMED",
+        "FALSE_BREAKOUT":"ফলস ব্রেকআউট" if bengali else "FALSE_BREAKOUT",
+        "FALSE_BREAKOUT_RISK":"ফলস ব্রেকআউট ঝুঁকি" if bengali else "FALSE_BREAKOUT_RISK",
+        "APPROACHING_BREAKDOWN":"ব্রেকডাউনের কাছাকাছি" if bengali else "APPROACHING_BREAKDOWN",
+        "BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত" if bengali else "BREAKDOWN_CONFIRMED",
+        "FALSE_BREAKDOWN":"ফলস ব্রেকডাউন" if bengali else "FALSE_BREAKDOWN",
+        "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউন ঝুঁকি" if bengali else "FALSE_BREAKDOWN_RISK",
+    }
+    label=labels.get(state,state.replace("_"," ").title())
+    if state=="INSIDE_RANGE": icon="🟡"
+    elif "BREAKDOWN" in state: icon="🔴"
+    elif "BREAKOUT" in state: icon="🟢"
+    else: icon="⚪"
+    return f"{icon} {label}"
+
+
 def analysis_keyboard(symbol: str, timeframe: str) -> InlineKeyboardMarkup:
     base=symbol.split('/')[0]
     return InlineKeyboardMarkup([
@@ -981,8 +1002,7 @@ def analysis_keyboard(symbol: str, timeframe: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("📋 Script",callback_data=f"pine|{base}|{timeframe}")],
         [InlineKeyboardButton("Set Alert", callback_data=f"al|{base}|{timeframe}"),
          InlineKeyboardButton("History", callback_data=f"hi|{base}|{timeframe}"),
-         InlineKeyboardButton("Trade Plan", callback_data=f"plan|{base}|{timeframe}"),
-         InlineKeyboardButton("Settings", callback_data="settings")],
+         InlineKeyboardButton("Trade Plan", callback_data=f"plan|{base}|{timeframe}")],
     ])
 
 
@@ -1109,10 +1129,7 @@ async def run_request(update: Update, request: Request) -> None:
             # Matplotlib is CPU-bound and not thread-safe; render promptly in event thread.
             image = BOT.chart(frame, request, result)
         bo = result["quant"]["breakout"]
-        state_bn={"INSIDE_RANGE":"রেঞ্জের ভেতরে","APPROACHING_BREAKOUT":"ব্রেকআউটের কাছাকাছি",
-                  "APPROACHING_BREAKDOWN":"ব্রেকডাউনের কাছাকাছি","BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত",
-                  "BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত","FALSE_BREAKOUT_RISK":"ফলস ব্রেকআউটের ঝুঁকি",
-                  "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউনের ঝুঁকি"}.get(bo['state'],bo['state'].replace('_',' ').title())
+        state_bn=colored_state(bo['state'],bengali=True)
         live_price=result["quant"].get("live_price")
         live_line=f"বর্তমান Binance price: {live_price:.10g} USDT\n" if live_price else "বর্তমান Binance price: সাময়িকভাবে unavailable\n"
         caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
@@ -1183,7 +1200,7 @@ async def send_trade_plan(message: Any,symbol: str,timeframe: str) -> None:
         event_text=f"শেষ event candle: {latest['close_time'][:16]} UTC\nEvent: {latest['state']} | Level {latest['level']:.8g} | Volume {latest['volume_ratio']:.2f}x | Body {latest['body_strength']*100:.0f}%"
     target_text="\n".join(f"Target {i}: {v:.8g}" for i,v in enumerate(targets,1)) if targets else f"Bull trigger: {b['bullish_trigger']:.8g}\nBear trigger: {b['bearish_trigger']:.8g}"
     stop_text=f"Stop Loss: {stop:.8g}" if stop else "Stop Loss: confirmation-এর পরে ATR/support-resistance অনুযায়ী নির্ধারণ হবে"
-    await message.reply_text(f"Trade Plan — {req.symbol} • {req.timeframe.upper()}\n\nবর্তমান Binance price: {current:.8g}\nশেষ closed candle: {frame.Close.iloc[-1]:.8g} ({frame.index[-1].isoformat()[:16]} UTC)\nঅবস্থা: {state}\nপরিকল্পনা: {direction}\nEntry reference: {entry:.8g}\n{stop_text}\n{target_text}\nInvalidation: {invalid}\n\n{event_text}\n\nকোনো breakout শতভাগ নিশ্চিত নয়। Target/SL শিক্ষামূলক ATR-based scenario; real order নয়।")
+    await message.reply_text(f"Trade Plan — {req.symbol} • {req.timeframe.upper()}\n\nবর্তমান Binance price: {current:.8g}\nশেষ closed candle: {frame.Close.iloc[-1]:.8g} ({frame.index[-1].isoformat()[:16]} UTC)\nঅবস্থা: {colored_state(state,bengali=True)}\nপরিকল্পনা: {direction}\nEntry reference: {entry:.8g}\n{stop_text}\n{target_text}\nInvalidation: {invalid}\n\n{event_text}\n\nকোনো breakout শতভাগ নিশ্চিত নয়। Target/SL শিক্ষামূলক ATR-based scenario; real order নয়।")
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1460,11 +1477,11 @@ async def load_breakout_events(symbol: str,timeframe: str,fallback: list[dict[st
 
 def history_text(symbol: str,timeframe: str,events: list[dict[str,Any]],tz_name: str) -> str:
     from zoneinfo import ZoneInfo
-    tz=ZoneInfo(tz_name); labels={"BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত","BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত","FALSE_BREAKOUT":"ফলস ব্রেকআউট","FALSE_BREAKDOWN":"ফলস ব্রেকডাউন"}
+    tz=ZoneInfo(tz_name)
     lines=[f"📚 {symbol} • {timeframe.upper()} Breakout History",f"সময়: {tz_name} (candle close time)"]
     for e in events[-10:]:
         dt=datetime.fromisoformat(e["close_time"]).astimezone(tz)
-        lines.append(f"\n{dt.strftime('%d %b %Y, %I:%M %p')}\n{labels.get(e['state'],e['state'])}\nLevel: {e['level']:.8g} | Volume: {e['volume_ratio']:.2f}x | Body: {e['body_strength']*100:.0f}%")
+        lines.append(f"\n{dt.strftime('%d %b %Y, %I:%M %p')}\n{colored_state(e['state'],bengali=True)}\nLevel: {e['level']:.8g} | Volume: {e['volume_ratio']:.2f}x | Body: {e['body_strength']*100:.0f}%")
     if len(lines)==2: lines.append("\nসাম্প্রতিক qualifying event পাওয়া যায়নি।")
     lines.append("\nHistory fully closed candle থেকে তৈরি। একই চলমান move বারবার নতুন breakout হিসেবে গণনা করা হয় না।")
     return "\n".join(lines)
@@ -1727,7 +1744,7 @@ def scanner_page(results: list[Any],tf: str,page: int) -> tuple[str,InlineKeyboa
     for i,(_,symbol,b) in enumerate(chunk,start+1):
         distance=min(abs(b["distance_to_bullish_pct"]),abs(b["distance_to_bearish_pct"]))
         live=f"{b['live_price']:.8g}" if b.get("live_price") else "unavailable"
-        lines.append(f"\n{i}. {symbol}\nবর্তমান {live} | শেষ closed {b.get('closed_price',0):.8g}\n{b['state']} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x | trigger দূরত্ব {distance:.2f}%\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
+        lines.append(f"\n{i}. {symbol}\nবর্তমান {live} | শেষ closed {b.get('closed_price',0):.8g}\n{colored_state(b['state'])} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x | trigger দূরত্ব {distance:.2f}%\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
     lines.append("\nScore probability নয়। Data শেষ closed candle-এর।")
     buttons=[]
     if page>0: buttons.append(InlineKeyboardButton("◀️ Previous",callback_data=f"scanpage|{tf}|{page-1}"))
@@ -1858,7 +1875,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if wanted and fingerprint != row['last_fingerprint'] and event_state != row['last_state']:
                 bo=q['breakout']; live=await BOT.fetch_live_price(req.symbol)
                 live_line=f"বর্তমান Binance price: {live['price']:.8g}\n" if live else ""
-                await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {event_state}\n{live_line}Signal closed candle: {candle[:16]} UTC\nSignal close: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
+                await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {colored_state(event_state)}\n{live_line}Signal closed candle: {candle[:16]} UTC\nSignal close: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
             await BOT.db.execute("UPDATE alerts SET last_state=$1,last_candle=$2,last_fingerprint=$3 WHERE id=$4",event_state,candle,fingerprint,row['id'])
         except Exception: log.exception("Alert check failed id=%s",row['id'])
     BOT.last_alert_scan=datetime.now(timezone.utc)
