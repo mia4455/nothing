@@ -566,6 +566,17 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         self.cache.set(cache_key,frame.copy(deep=True),ttl)
         return frame
 
+    async def fetch_live_price(self, symbol: str) -> dict[str,Any]:
+        """Fetch an uncached Binance ticker for display; never confirms a signal."""
+        try:
+            ticker=await self.exchange.fetch_ticker(symbol)
+            price=float(ticker.get("last") or ticker.get("close") or 0)
+            if price<=0: raise ValueError("empty ticker")
+            return {"price":price,"bid":ticker.get("bid"),"ask":ticker.get("ask"),"timestamp":ticker.get("timestamp")}
+        except Exception as exc:
+            log.warning("Live ticker unavailable for %s: %s",symbol,exc)
+            return {}
+
     async def external_context(self, request: Request, all_market: bool = False) -> dict[str, Any]:
         """Best-effort public futures context and reputable RSS headlines.
 
@@ -661,8 +672,12 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         except Exception as exc:
             log.warning("Market filter unavailable: %s",exc); return {}
 
-    async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard") -> dict[str, Any]:
+    async def analyze(self, request: Request, frame: pd.DataFrame, detail_mode: str = "standard", live: dict[str,Any] | None = None) -> dict[str, Any]:
         quant = quant_snapshot(frame)
+        live=live or {}
+        quant["live_price"]=live.get("price")
+        quant["last_closed_price"]=float(frame.Close.iloc[-1])
+        quant["last_closed_time"]=frame.index[-1].isoformat()
         context, higher, market = await asyncio.gather(self.external_context(request), self.higher_timeframe(request), self.market_filter(request.timeframe))
         quant["retest"]=retest_state(frame,quant["breakout"])
         quant["explainable_score"]=explainable_score(quant,higher,market,context)
@@ -682,7 +697,7 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         prompt = f"""Analyze {request.symbol} on {request.timeframe}. Python has already calculated the authoritative metrics below.
 The user request was: {json.dumps(request.transcript, ensure_ascii=False)}
 Requested report mode: {detail_mode}. {detail_instruction}
-Do not replace or recalculate these levels. Explain structure, RSI, MACD, EMAs, Bollinger position, volume, S1-S3/R1-R3, invalidation and two conditional scenarios in Bengali. Include an educational risk warning.
+Do not replace or recalculate these levels. LIVE_PRICE is the current uncached ticker, while LAST_CLOSED_PRICE/TIME is the confirmed candle used for indicators and signals. Clearly distinguish them; never describe the closed price as current. Explain structure, RSI, MACD, EMAs, Bollinger position, volume, S1-S3/R1-R3, invalidation and two conditional scenarios in Bengali. Include an educational risk warning.
 QUANT: {json.dumps(quant, separators=(',', ':'))}
 HIGHER_TIMEFRAME: {json.dumps(higher, separators=(',', ':'))}
 BTC_ETH_MARKET_FILTER: {json.dumps(market, separators=(',', ':'))}
@@ -966,6 +981,7 @@ def analysis_keyboard(symbol: str, timeframe: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("📋 Script",callback_data=f"pine|{base}|{timeframe}")],
         [InlineKeyboardButton("Set Alert", callback_data=f"al|{base}|{timeframe}"),
          InlineKeyboardButton("History", callback_data=f"hi|{base}|{timeframe}"),
+         InlineKeyboardButton("Trade Plan", callback_data=f"plan|{base}|{timeframe}"),
          InlineKeyboardButton("Settings", callback_data="settings")],
     ])
 
@@ -1073,10 +1089,10 @@ async def run_request(update: Update, request: Request) -> None:
     try:
         async with BOT.semaphore:
             await message.chat.send_action(ChatAction.TYPING)
-            frame = await BOT.fetch_candles(request)
+            frame,live = await asyncio.gather(BOT.fetch_candles(request),BOT.fetch_live_price(request.symbol))
             settings=await BOT.user_settings(update.effective_user.id if update.effective_user else None)
             detail_mode=requested_detail_mode(request.transcript,settings["detail_mode"])
-            result = await BOT.analyze(request, frame, detail_mode=detail_mode)
+            result = await BOT.analyze(request, frame, detail_mode=detail_mode,live=live)
             apply_confirmation_mode(result,settings["risk_mode"])
             if detail_mode=="quick":
                 result["analysis_bn"]=quick_report(request,result)
@@ -1097,8 +1113,10 @@ async def run_request(update: Update, request: Request) -> None:
                   "APPROACHING_BREAKDOWN":"ব্রেকডাউনের কাছাকাছি","BREAKOUT_CONFIRMED":"ব্রেকআউট নিশ্চিত",
                   "BREAKDOWN_CONFIRMED":"ব্রেকডাউন নিশ্চিত","FALSE_BREAKOUT_RISK":"ফলস ব্রেকআউটের ঝুঁকি",
                   "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউনের ঝুঁকি"}.get(bo['state'],bo['state'].replace('_',' ').title())
+        live_price=result["quant"].get("live_price")
+        live_line=f"বর্তমান Binance price: {live_price:.10g} USDT\n" if live_price else "বর্তমান Binance price: সাময়িকভাবে unavailable\n"
         caption = (f"📊 {request.symbol} • {request.timeframe.upper()}\n"
-                   f"শেষ বন্ধ মূল্য: {frame.Close.iloc[-1]:.10g} USDT\n"
+                   f"{live_line}শেষ বন্ধ candle: {frame.Close.iloc[-1]:.10g} USDT ({frame.index[-1].strftime('%d %b %Y %H:%M UTC')})\n"
                    f"বর্তমান অবস্থা: {state_bn}\n"
                    f"উপরের ট্রিগার: {bo['bullish_trigger']:.8g}\nনিচের ট্রিগার: {bo['bearish_trigger']:.8g}\n"
                    f"সম্পূর্ণ ব্যাখ্যা নিচের বার্তায় দেওয়া হয়েছে।")
@@ -1143,9 +1161,39 @@ async def market_cap_answer(message: Message,text: str) -> None:
         log.warning("CoinGecko market-cap lookup failed: %s",exc)
         await message.reply_text("⚠️ Market cap/dominance data এখন পাওয়া যাচ্ছে না। কিছুক্ষণ পরে চেষ্টা করুন।")
 
+async def send_trade_plan(message: Any,symbol: str,timeframe: str) -> None:
+    """Create a fresh educational SL/TP plan from live price and closed candles."""
+    assert BOT is not None
+    req=Request(BOT._normalize_symbol(symbol),BOT._normalize_tf(timeframe))
+    frame,live=await asyncio.gather(BOT.fetch_candles(req),BOT.fetch_live_price(req.symbol)); q=quant_snapshot(frame); b=q["breakout"]
+    current=float(live.get("price") or frame.Close.iloc[-1]); atr=float(q["atr"]); state=b["state"]
+    if state=="BREAKOUT_CONFIRMED": direction="LONG"; entry=max(current,float(b["bullish_trigger"])); stop=min(float(q["supports"][0]["price"]),entry-atr)
+    elif state=="BREAKDOWN_CONFIRMED": direction="SHORT"; entry=min(current,float(b["bearish_trigger"])); stop=max(float(q["resistances"][0]["price"]),entry+atr)
+    else:
+        direction="WAIT / CONDITIONAL"; entry=current; stop=0
+    events=scan_breakout_history(frame,timeframe=req.timeframe); latest=events[-1] if events else None
+    if direction=="LONG":
+        risk=entry-stop; targets=[entry+risk*x for x in (1,2,3)]; invalid=f"Closed candle {stop:.8g}-এর নিচে"
+    elif direction=="SHORT":
+        risk=stop-entry; targets=[entry-risk*x for x in (1,2,3)]; invalid=f"Closed candle {stop:.8g}-এর উপরে"
+    else:
+        targets=[]; invalid="Bull/Bear trigger-এর বাইরে শক্ত closed-candle confirmation না আসা পর্যন্ত entry নয়"
+    event_text="সাম্প্রতিক qualifying breakout candle পাওয়া যায়নি।"
+    if latest:
+        event_text=f"শেষ event candle: {latest['close_time'][:16]} UTC\nEvent: {latest['state']} | Level {latest['level']:.8g} | Volume {latest['volume_ratio']:.2f}x | Body {latest['body_strength']*100:.0f}%"
+    target_text="\n".join(f"Target {i}: {v:.8g}" for i,v in enumerate(targets,1)) if targets else f"Bull trigger: {b['bullish_trigger']:.8g}\nBear trigger: {b['bearish_trigger']:.8g}"
+    stop_text=f"Stop Loss: {stop:.8g}" if stop else "Stop Loss: confirmation-এর পরে ATR/support-resistance অনুযায়ী নির্ধারণ হবে"
+    await message.reply_text(f"Trade Plan — {req.symbol} • {req.timeframe.upper()}\n\nবর্তমান Binance price: {current:.8g}\nশেষ closed candle: {frame.Close.iloc[-1]:.8g} ({frame.index[-1].isoformat()[:16]} UTC)\nঅবস্থা: {state}\nপরিকল্পনা: {direction}\nEntry reference: {entry:.8g}\n{stop_text}\n{target_text}\nInvalidation: {invalid}\n\n{event_text}\n\nকোনো breakout শতভাগ নিশ্চিত নয়। Target/SL শিক্ষামূলক ATR-based scenario; real order নয়।")
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     text=update.effective_message.text.lower()
+    if any(x in text for x in ("stop loss","স্টপ লস","target 1","টার্গেট","trade plan","ট্রেড প্ল্যান")):
+        try:
+            req=await BOT.parse_text(update.effective_message.text); await send_trade_plan(update.effective_message,req.symbol,req.timeframe)
+        except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
+        return
     if any(x in text for x in ("dominance","ডমিনেন্স","ডমিন্যান্স","market cap","marketcap","মার্কেট ক্যাপ")):
         await market_cap_answer(update.effective_message,update.effective_message.text); return
     if any(x in text for x in ("খবর","নিউজ","news","মিটিং","meeting","প্রোগ্রাম","program","event","ইভেন্ট","ভাষণ","speech")):
@@ -1271,6 +1319,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text(detail,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← মূল Guide",callback_data="guidehome")]])); return
         if parts[0]=="an" and len(parts)==3:
             await run_request(update,Request(BOT._normalize_symbol(parts[1]),BOT._normalize_tf(parts[2]))); return
+        if parts[0]=="plan" and len(parts)==3:
+            await send_trade_plan(q.message,parts[1],parts[2]); return
         if parts[0]=="scanpage" and len(parts)==3:
             tf=BOT._normalize_tf(parts[1]); page=int(parts[2]); uid=update.effective_user.id
             results=BOT.cache.get(f"scanner:{uid}:{tf}")
@@ -1426,10 +1476,11 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.effective_message.reply_text("ব্যবহার: /history SUI 4h"); return
     try:
         req=Request(BOT._normalize_symbol(context.args[0]), BOT._normalize_tf(context.args[1] if len(context.args)>1 else "4h"))
-        frame=await BOT.fetch_candles(req); events=scan_breakout_history(frame,timeframe=req.timeframe)
+        frame,live=await asyncio.gather(BOT.fetch_candles(req),BOT.fetch_live_price(req.symbol)); events=scan_breakout_history(frame,timeframe=req.timeframe)
         await save_breakout_events(req.symbol,req.timeframe,events); events=await load_breakout_events(req.symbol,req.timeframe,events)
         settings=await BOT.user_settings(update.effective_user.id)
-        await send_long(update.effective_message,history_text(req.symbol,req.timeframe,events,settings["timezone"]))
+        current=f"বর্তমান Binance price: {live['price']:.8g}\nশেষ closed candle: {frame.Close.iloc[-1]:.8g} ({frame.index[-1].isoformat()[:16]} UTC)\n\n" if live else ""
+        await send_long(update.effective_message,current+history_text(req.symbol,req.timeframe,events,settings["timezone"]))
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1675,7 +1726,8 @@ def scanner_page(results: list[Any],tf: str,page: int) -> tuple[str,InlineKeyboa
     lines=[f"Market Scanner — {tf.upper()}",f"পৃষ্ঠা {page+1}/{max(1,(len(results)+9)//10)} • ফলাফল {start+1}–{start+len(chunk)} of {len(results)}"]
     for i,(_,symbol,b) in enumerate(chunk,start+1):
         distance=min(abs(b["distance_to_bullish_pct"]),abs(b["distance_to_bearish_pct"]))
-        lines.append(f"\n{i}. {symbol}\n{b['state']} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x | trigger দূরত্ব {distance:.2f}%\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
+        live=f"{b['live_price']:.8g}" if b.get("live_price") else "unavailable"
+        lines.append(f"\n{i}. {symbol}\nবর্তমান {live} | শেষ closed {b.get('closed_price',0):.8g}\n{b['state']} | score {b['bullish_setup_score']}/100 | volume {b['volume_ratio']:.2f}x | trigger দূরত্ব {distance:.2f}%\nBull {b['bullish_trigger']:.8g} | Bear {b['bearish_trigger']:.8g}")
     lines.append("\nScore probability নয়। Data শেষ closed candle-এর।")
     buttons=[]
     if page>0: buttons.append(InlineKeyboardButton("◀️ Previous",callback_data=f"scanpage|{tf}|{page-1}"))
@@ -1698,10 +1750,12 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 candidates.append((float(t.get("quoteVolume") or 0),symbol))
         # Scan enough liquid pairs to retain 60 even if a few endpoints fail.
         symbols=[s for _,s in sorted(candidates,reverse=True)[:70]]
+        live_prices={s:float((tickers.get(s) or {}).get("last") or (tickers.get(s) or {}).get("close") or 0) for s in symbols}
         sem=asyncio.Semaphore(6)
         async def scan(symbol):
             async with sem:
                 f=await BOT.fetch_candles(Request(symbol,tf)); q=quant_snapshot(f); b=q["breakout"]
+                b["live_price"]=live_prices.get(symbol); b["closed_price"]=float(f.Close.iloc[-1]); b["closed_time"]=f.index[-1].isoformat()
                 distance=min(abs(b["distance_to_bullish_pct"]),abs(b["distance_to_bearish_pct"]))
                 direction_score=max(b["bullish_setup_score"],b["bearish_setup_score"])
                 rank=direction_score+(10 if b["squeeze"] else 0)-min(distance,10)
@@ -1802,8 +1856,9 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",req.symbol,req.timeframe,opened,closed,normalized_type,level,q['last'],q['breakout']['volume_ratio'],q['breakout']['body_strength'])
             if wanted and fingerprint != row['last_fingerprint'] and event_state != row['last_state']:
-                bo=q['breakout']
-                await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {event_state}\nClosed candle: {candle[:16]}\nPrice: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nএটি আর্থিক পরামর্শ নয়।")
+                bo=q['breakout']; live=await BOT.fetch_live_price(req.symbol)
+                live_line=f"বর্তমান Binance price: {live['price']:.8g}\n" if live else ""
+                await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {event_state}\n{live_line}Signal closed candle: {candle[:16]} UTC\nSignal close: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
             await BOT.db.execute("UPDATE alerts SET last_state=$1,last_candle=$2,last_fingerprint=$3 WHERE id=$4",event_state,candle,fingerprint,row['id'])
         except Exception: log.exception("Alert check failed id=%s",row['id'])
     BOT.last_alert_scan=datetime.now(timezone.utc)
