@@ -984,10 +984,14 @@ def colored_state(state: str, bengali: bool = False) -> str:
         "FALSE_BREAKDOWN_RISK":"ফলস ব্রেকডাউন ঝুঁকি" if bengali else "FALSE_BREAKDOWN_RISK",
     }
     label=labels.get(state,state.replace("_"," ").title())
-    if "FALSE" in state: icon="🟠"
-    elif state=="INSIDE_RANGE": icon="🟡"
-    elif "BREAKDOWN" in state: icon="🔴"
-    elif "BREAKOUT" in state: icon="🟢"
+    # Give every state family a visually distinct, free standard emoji.
+    # Green/red are reserved for confirmed signals only.
+    if "FALSE" in state: icon="⚠️"
+    elif state=="INSIDE_RANGE": icon="↔️"
+    elif state=="APPROACHING_BREAKOUT": icon="🔼"
+    elif state=="APPROACHING_BREAKDOWN": icon="🔽"
+    elif state=="BREAKOUT_CONFIRMED": icon="🟢"
+    elif state=="BREAKDOWN_CONFIRMED": icon="🔴"
     else: icon="⚪"
     return f"{icon} {label}"
 
