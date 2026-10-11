@@ -1232,8 +1232,11 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
             d.polygon([(cx,160),(cx-62,270),(cx,238),(cx+62,270)],fill=(235,237,255,255))
             d.polygon([(cx,370),(cx-62,282),(cx,315),(cx+62,282)],fill=(180,185,245,255))
         else:
-            badge="₿" if base=="BTC" else base[:4]; badge_font=_card_font(82 if base=="BTC" else 56,True); bb=d.textbbox((0,0),badge,font=badge_font)
-            d.text((168-(bb[2]-bb[0])/2,265-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=2,stroke_fill="white")
+            badge="B" if base=="BTC" else base[:4]; badge_font=_card_font(82 if base=="BTC" else 56,True); bb=d.textbbox((0,0),badge,font=badge_font)
+            tx,ty=168-(bb[2]-bb[0])/2,265-(bb[3]-bb[1])/2
+            d.text((tx,ty),badge,font=badge_font,fill="white",stroke_width=2,stroke_fill="white")
+            if base=="BTC":
+                d.line((153,198,153,332),fill="white",width=7); d.line((180,198,180,332),fill="white",width=7)
 
     # Name above, large price in the middle, brand directly below—matching the reference.
     center_x=745
@@ -1241,22 +1244,27 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
     d.text((center_x-(tb[2]-tb[0])/2,45),title,font=title_font,fill="white",stroke_width=1,stroke_fill="white")
     price_text=f"${price:.8f}".rstrip("0").rstrip(".")
     if price>=100: price_text=f"${price:.2f}"
-    price_font=_card_font(126,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
-    d.text((center_x-(pb[2]-pb[0])/2,150),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
+    # Keep a large price, but shrink only when necessary so candles can always
+    # begin after the final digit instead of crossing over the number.
+    price_size=126
+    while True:
+        price_font=_card_font(price_size,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
+        price_x=center_x-(pb[2]-pb[0])/2; price_right=price_x+(pb[2]-pb[0])
+        if price_right<=1260 or price_size<=92: break
+        price_size-=4
+    d.text((price_x,150),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
     brand="CRYPTO AI MASTER"; brand_font=_card_font(45,True); wb=d.textbbox((0,0),brand,font=brand_font)
     d.text((center_x-(wb[2]-wb[0])/2,350),brand,font=brand_font,fill=(220,220,230),stroke_width=1,stroke_fill=(220,220,230))
 
     # Five compact Binance-style candles on the right.
-    # Compact reference-style candle cluster: five small candles begin near 65%
-    # of the card and finish early, leaving deliberate empty space on the right.
-    chart=(1040,90,1360,365); x0,y0,x1,y1=chart
+    # Begin immediately after the final price digit. Five candles occupy a
+    # dense, fixed-width mini-chart like Binance/TradingView, never the title.
+    x0=int(price_right+24); x1=min(1540,x0+255); y0,y1=112,358
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
-    lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
-    # Compress the market range into the middle 62% vertically so a volatile
-    # candle can never become an oversized block in the Telegram preview.
-    inner_top=y0+52; inner_bottom=y1-52
+    lo,hi=min(lows),max(highs); span=max(hi-lo,1e-12)
+    inner_top=y0+43; inner_bottom=y1-43
     scale=lambda v: inner_bottom-(float(v)-lo)/span*(inner_bottom-inner_top)
-    step=(x1-x0)/max(1,len(last)); body=max(12,int(step*.43))
+    step=(x1-x0)/max(1,len(last)); body=max(16,int(step*.70))
     for i,c in enumerate(last):
         o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
         d.line((cx,scale(high),cx,scale(low)),fill=color,width=3)
