@@ -1475,11 +1475,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if not BOT.db: await q.answer("DATABASE_URL required",show_alert=True); return
             if parts[0]=="futtoggle": await BOT.db.execute("UPDATE paper_trades SET enabled=NOT enabled WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
             elif parts[0]=="futdel": await BOT.db.execute("UPDATE paper_trades SET status='cancelled',enabled=FALSE,closed_at=NOW() WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
-            rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE telegram_id=$1 AND status='active' ORDER BY id DESC LIMIT 30",update.effective_user.id)
+            rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE telegram_id=$1 AND status='active' ORDER BY id ASC LIMIT 30",update.effective_user.id)
             buttons=[]; lines=["Futures Trade Manager — Active Positions"]
-            for r in rows:
-                state="🟢 ON" if r['enabled'] else "🔴 OFF"; lines.append(f"#{r['id']} {r['symbol']} {r['direction'].upper()} — {state}\nEntry {r['entry']:g} | SL {r['stop']:g} | TP1 {r['target']:g}")
-                buttons.append([InlineKeyboardButton(f"#{r['id']} • {state}",callback_data=f"futtoggle|{r['id']}"),InlineKeyboardButton("🗑 Remove",callback_data=f"futdel|{r['id']}")])
+            for display_no,r in enumerate(rows,1):
+                state="🟢 ON" if r['enabled'] else "🔴 OFF"; lines.append(f"#{display_no} {r['symbol']} {r['direction'].upper()} — {state}\nEntry {r['entry']:g} | SL {r['stop']:g} | TP1 {r['target']:g}")
+                buttons.append([InlineKeyboardButton(f"#{display_no} • {state}",callback_data=f"futtoggle|{r['id']}"),InlineKeyboardButton("🗑 Remove",callback_data=f"futdel|{r['id']}")])
             buttons.append([InlineKeyboardButton("➕ Add Futures Trade",callback_data="futadd")])
             await q.edit_message_text("\n\n".join(lines) if rows else "No active futures trades.",reply_markup=InlineKeyboardMarkup(buttons)); return
         if parts[0]=="patoggle" and len(parts)==2:
@@ -1862,8 +1862,9 @@ async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int
             symbol=BOT._normalize_symbol(str(data["symbol"])); entry=float(data["entry"]); stop=float(data["stop"]); target=float(data["target1"]); direction=str(data["direction"]).lower()
             valid=(direction=="long" and stop<entry<target) or (direction=="short" and target<entry<stop)
             if min(entry,stop,target)<=0 or not valid: raise UserInputError("Screenshot-এর Entry/SL/TP সম্পর্ক সঠিকভাবে যাচাই করা যায়নি।")
-            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target})
-            await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
+            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"cleanup":[]})
+            detected=await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
+            context.user_data["fut"]["cleanup"].append(detected)
             return FUT_TP2
         except UserInputError as exc:
             await message.reply_text(f"⚠️ {exc}\nআরেকটি পরিষ্কার screenshot পাঠান অথবা coin symbol লিখে manual setup করুন।"); return FUT_SYMBOL
@@ -1881,7 +1882,11 @@ async def futures_number_step(update: Update,context: ContextTypes.DEFAULT_TYPE,
         try:
             value=float(raw.replace(",","")); assert value>0; context.user_data["fut"][key]=value
         except Exception: await update.effective_message.reply_text("Positive number দিন, অথবা optional target-এর জন্য - পাঠান।"); return next_state-1
-    await update.effective_message.reply_text(prompt); return next_state
+    sent=await update.effective_message.reply_text(prompt)
+    cleanup=context.user_data.get("fut",{}).get("cleanup")
+    if cleanup is not None:
+        cleanup.extend([update.effective_message,sent])
+    return next_state
 
 async def futures_entry(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"entry",FUT_STOP,"Step 3/6 — Stop Loss লিখুন।")
 async def futures_stop(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"stop",FUT_TP1,"Step 4/6 — Target 1 লিখুন।")
@@ -1899,7 +1904,12 @@ async def futures_tp3(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
         await update.effective_message.reply_text("Invalid levels। Long: SL < Entry < TP1 < TP2 < TP3; Short-এ উল্টো। আবার /futures থেকে শুরু করুন।"); return ConversationHandler.END
     await BOT.ensure_user(update)
     row=await BOT.db.fetchrow("INSERT INTO paper_trades(telegram_id,chat_id,symbol,timeframe,direction,entry,stop,target,target2,target3,enabled) VALUES($1,$2,$3,'1m',$4,$5,$6,$7,$8,$9,TRUE) RETURNING id",update.effective_user.id,update.effective_chat.id,d["symbol"],direction,entry,stop,tp1,d.get("target2"),d.get("target3"))
-    await update.effective_message.reply_text(f"✅ Futures Trade #{row['id']} added\n{d['symbol']} • {direction.upper()}\nEntry {entry:g} | SL {stop:g}\nTP1 {tp1:g}"+(f" | TP2 {d['target2']:g}" if d.get('target2') else "")+(f" | TP3 {d['target3']:g}" if d.get('target3') else "")+"\n\nMonitoring uses live price + closed 1m candle. Virtual alerts only.")
+    display_no=await BOT.db.fetchval("SELECT count(*) FROM paper_trades WHERE telegram_id=$1 AND status='active'",update.effective_user.id)
+    await update.effective_message.reply_text(f"✅ Futures Trade #{display_no} added\n{d['symbol']} • {direction.upper()}\nEntry {entry:g} | SL {stop:g}\nTP1 {tp1:g}"+(f" | TP2 {d['target2']:g}" if d.get('target2') else "")+(f" | TP3 {d['target3']:g}" if d.get('target3') else "")+"\n\nMonitoring uses live price + closed 1m candle. Virtual alerts only.")
+    cleanup=d.get("cleanup")
+    if cleanup is not None:
+        cleanup.append(update.effective_message)
+        for temporary in cleanup: asyncio.create_task(delete_message_after(temporary,30))
     context.user_data.pop("fut",None); return ConversationHandler.END
 
 async def futures_cancel(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
@@ -2230,7 +2240,7 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not BOT.db: return
-    rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE status='active' AND enabled ORDER BY id LIMIT 100")
+    rows=await BOT.db.fetch("SELECT * FROM (SELECT p.*,ROW_NUMBER() OVER(PARTITION BY telegram_id ORDER BY id) AS display_no FROM paper_trades p WHERE status='active') ranked WHERE enabled ORDER BY id LIMIT 100")
     for r in rows:
         try:
             ticker,candles=await asyncio.gather(BOT.fetch_live_price(r['symbol']),BOT.exchange.fetch_ohlcv(r['symbol'],'1m',limit=2))
@@ -2239,7 +2249,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             stop_hit=(low<=r['stop']) if long else (high>=r['stop'])
             if stop_hit:
                 await BOT.db.execute("UPDATE paper_trades SET status='stop_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2 AND status='active'",r['stop'],r['id'])
-                await context.bot.send_message(r['chat_id'],f"🛑 Futures Trade #{r['id']} — STOP LOSS HIT\n{r['symbol']} • {r['direction'].upper()}\nSL: {r['stop']:g} | Live: {live:g}\nSource: Binance live + closed 1m candle\n\nVirtual monitoring only; no real order was placed.")
+                await context.bot.send_message(r['chat_id'],f"🛑 Futures Trade #{r['display_no']} — STOP LOSS HIT\n{r['symbol']} • {r['direction'].upper()}\nSL: {r['stop']:g} | Live: {live:g}\nSource: Binance live + closed 1m candle\n\nVirtual monitoring only; no real order was placed.")
                 continue
             targets=[(1,r['target'],r['tp1_hit']),(2,r['target2'],r['tp2_hit']),(3,r['target3'],r['tp3_hit'])]
             for number,target,already in targets:
@@ -2247,7 +2257,7 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 hit=(high>=target) if long else (low<=target)
                 if hit:
                     await BOT.db.execute(f"UPDATE paper_trades SET tp{number}_hit=TRUE WHERE id=$1",r['id'])
-                    await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['id']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
+                    await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['display_no']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
             last_number=3 if r['target3'] is not None else 2 if r['target2'] is not None else 1
             last_target=r['target3'] or r['target2'] or r['target']; last_hit=(high>=last_target) if long else (low<=last_target)
             if last_hit: await BOT.db.execute("UPDATE paper_trades SET status='target_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2",last_target,r['id'])
