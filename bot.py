@@ -1187,15 +1187,16 @@ def _card_font(size: int,bold: bool=False) -> Any:
 
 def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
     """Render a reference-inspired price card entirely in memory."""
-    w,h=1600,700; up=change>=0; accent=(0,245,45) if up else (255,45,48)
-    img=Image.new("RGB",(w,h),(3,7,28)); px=img.load()
-    for y in range(h):
-        for x in range(w):
-            glow=max(0,1-((x-w*.48)**2/(w*.7)**2+(y-h*.48)**2/(h*.8)**2))
-            px[x,y]=(int(4+12*glow),int(7+3*glow),int(28+25*glow))
+    w,h=1600,700; up=change>=0; accent=(0,255,25) if up else (255,42,45)
+    # Use the clean reference-derived neon background shipped with the project.
+    # Fall back safely if an incomplete deployment omits the asset.
+    asset=os.path.join(os.path.dirname(os.path.abspath(__file__)),"assets","price_card_background.jpg")
+    try:
+        img=Image.open(asset).convert("RGB").resize((w,h),Image.Resampling.LANCZOS)
+    except Exception as exc:
+        log.warning("Price-card background unavailable (%s); using dark fallback",exc)
+        img=Image.new("RGB",(w,h),(3,7,28))
     d=ImageDraw.Draw(img,"RGBA")
-    for x in range(0,w,95): d.line((x,0,x,h),fill=(30,80,130,28),width=1)
-    for y in range(0,h,80): d.line((0,y,w,y),fill=(30,80,130,28),width=1)
     # Coin badge and dynamic title.
     base=symbol.split('/')[0]; d.ellipse((45,35,155,145),fill=(210,145,28,255),outline=(255,220,110,255),width=5)
     badge=base[:3]; bb=d.textbbox((0,0),badge,font=_card_font(30,True)); d.text(((200-(bb[2]-bb[0]))/2,76),badge,font=_card_font(30,True),fill="white")
