@@ -1193,10 +1193,10 @@ def _card_font(size: int,bold: bool=False) -> Any:
     except TypeError: return ImageFont.load_default()
 
 
-def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
+def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]],logo_bytes: bytes | None = None) -> io.BytesIO:
     """Render a reference-inspired price card entirely in memory."""
-    # Telegram mobile previews preserve this ~2.28:1 ratio without center-cropping.
-    w,h=1600,700; up=change>=0; accent=(0,255,20) if up else (255,38,42)
+    # Match the user's compact reference card (~3.13:1).
+    w,h=1600,510; up=change>=0; accent=(0,255,20) if up else (255,38,42)
     # Use the clean reference-derived neon background shipped with the project.
     # Fall back safely if an incomplete deployment omits the asset.
     root=os.path.dirname(os.path.abspath(__file__))
@@ -1215,21 +1215,39 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
         log.warning("Price-card background unavailable (%s); using dark fallback",exc)
         img=Image.new("RGB",(w,h),(3,7,28))
     d=ImageDraw.Draw(img,"RGBA")
-    # Keep important content inside Telegram's rounded-corner safe area.
-    base=symbol.split('/')[0]; d.ellipse((48,38,148,138),fill=(210,145,28,255),outline=(255,220,110,255),width=4)
-    badge=base[:3]; badge_font=_card_font(25,True); bb=d.textbbox((0,0),badge,font=badge_font)
-    d.text((98-(bb[2]-bb[0])/2,88-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
-    d.text((170,50),f"{name.upper()} ({base})",font=_card_font(48,True),fill="white",stroke_width=1,stroke_fill="white")
+    base=symbol.split('/')[0]
+    # Large real coin logo on the far left; a clean ticker badge is the offline fallback.
+    logo_box=(38,135,298,395); logo_size=260
+    logo_drawn=False
+    if logo_bytes:
+        try:
+            logo=Image.open(io.BytesIO(logo_bytes)).convert("RGBA").resize((logo_size,logo_size),Image.Resampling.LANCZOS)
+            mask=Image.new("L",(logo_size,logo_size),0); ImageDraw.Draw(mask).ellipse((0,0,logo_size-1,logo_size-1),fill=255)
+            img.paste(logo,(logo_box[0],logo_box[1]),mask); logo_drawn=True
+        except Exception as exc: log.warning("Coin logo render failed for %s: %s",symbol,exc)
+    if not logo_drawn:
+        d.ellipse(logo_box,fill=(225,145,28,255) if base=="BTC" else (75,82,150,255),outline=(255,220,110,255) if base=="BTC" else (190,195,255,255),width=7)
+        if base=="ETH":
+            cx,cy=168,265
+            d.polygon([(cx,160),(cx-62,270),(cx,238),(cx+62,270)],fill=(235,237,255,255))
+            d.polygon([(cx,370),(cx-62,282),(cx,315),(cx+62,282)],fill=(180,185,245,255))
+        else:
+            badge="₿" if base=="BTC" else base[:4]; badge_font=_card_font(82 if base=="BTC" else 56,True); bb=d.textbbox((0,0),badge,font=badge_font)
+            d.text((168-(bb[2]-bb[0])/2,265-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=2,stroke_fill="white")
+
+    # Name above, large price in the middle, brand directly below—matching the reference.
+    center_x=745
+    title=f"{name.title()} ({base})"; title_font=_card_font(58,True); tb=d.textbbox((0,0),title,font=title_font)
+    d.text((center_x-(tb[2]-tb[0])/2,45),title,font=title_font,fill="white",stroke_width=1,stroke_fill="white")
     price_text=f"${price:.8f}".rstrip("0").rstrip(".")
     if price>=100: price_text=f"${price:.2f}"
-    price_font=_card_font(140,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
-    # True image-centred price. The five-candle panel starts immediately after it.
-    price_x=800-(pb[2]-pb[0])/2
-    d.text((price_x,205),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
-    brand_font=_card_font(38,False); wb=d.textbbox((0,0),PRICE_CARD_BRAND,font=brand_font)
-    d.text((800-(wb[2]-wb[0])/2,390),PRICE_CARD_BRAND,font=brand_font,fill=(235,235,240))
-    # Five tightly spaced real 15-minute candles on the right.
-    chart=(1170,65,1545,635); x0,y0,x1,y1=chart
+    price_font=_card_font(126,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
+    d.text((center_x-(pb[2]-pb[0])/2,150),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
+    brand="CRYPTO AI MASTER"; brand_font=_card_font(45,True); wb=d.textbbox((0,0),brand,font=brand_font)
+    d.text((center_x-(wb[2]-wb[0])/2,350),brand,font=brand_font,fill=(220,220,230),stroke_width=1,stroke_fill=(220,220,230))
+
+    # Five compact Binance-style candles on the right.
+    chart=(1180,70,1550,425); x0,y0,x1,y1=chart
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
     scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
@@ -1995,6 +2013,27 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(uid,f"🎉 আপনার Pro subscription অনুমোদিত হয়েছে।\nমেয়াদ: {days} দিন\n\n{plan_text('pro')}\n\nসব Pro command জানতে /help পাঠান।")
     except Exception: log.warning("Could not notify approved user %s",uid)
 
+async def fetch_coin_logo(symbol: str) -> bytes | None:
+    """Best-effort CoinGecko logo lookup, cached for 24 hours."""
+    assert BOT is not None
+    base=symbol.split('/')[0].lower(); key=f"coinlogo:{base}"; cached=BOT.cache.get(key)
+    if cached is not None: return cached or None
+    try:
+        timeout=aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout,headers={"User-Agent":"CryptoAnalystBot/1.0"}) as session:
+            async with session.get("https://api.coingecko.com/api/v3/search",params={"query":base}) as response:
+                response.raise_for_status(); coins=(await response.json()).get("coins",[])
+            matches=[c for c in coins if str(c.get("symbol","")).lower()==base]
+            coin=sorted(matches,key=lambda c:c.get("market_cap_rank") or 10**9)[0] if matches else None
+            url=(coin or {}).get("large") or (coin or {}).get("thumb")
+            if not url: raise ValueError("logo unavailable")
+            async with session.get(url) as response:
+                response.raise_for_status(); data=await response.read()
+        BOT.cache.set(key,data,ttl=86400); return data
+    except Exception as exc:
+        log.warning("Coin logo unavailable for %s: %s",symbol,exc); BOT.cache.set(key,b"",ttl=3600); return None
+
+
 async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Publish due image cards to the configured Telegram channel."""
     assert BOT is not None
@@ -2005,7 +2044,8 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             symbol=row['symbol']; ticker=await BOT.exchange.fetch_ticker(symbol); price=float(ticker.get('last') or ticker.get('close'))
             change=float(ticker.get('percentage') or 0); candles=await BOT.exchange.fetch_ohlcv(symbol,"15m",limit=10)
             base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
-            card=make_price_card(symbol,name,price,change,candles)
+            logo=await fetch_coin_logo(symbol)
+            card=make_price_card(symbol,name,price,change,candles,logo_bytes=logo)
             price_text=f"${price:.8f}".rstrip('0').rstrip('.')
             if price>=100: price_text=f"${price:.2f}"
             price_tag=f"@{base.lower()}_price"
