@@ -1041,6 +1041,13 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def delete_message_after(message: Any, seconds: int = 30) -> None:
+    """Best-effort cleanup for temporary confirmations."""
+    await asyncio.sleep(seconds)
+    try: await message.delete()
+    except Exception: pass
+
+
 async def send_long(message: Any, text: str) -> None:
     """Send every character as numbered plain-text parts below Telegram's limit."""
     chunks = split_telegram_text(text)
@@ -1582,10 +1589,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await q.message.reply_text("✅ Reminder চালু হয়েছে।" if active else "⏹ Reminder বন্ধ হয়েছে।"); return
         if parts[0]=="wlrm" and len(parts)==2:
             symbol=BOT._normalize_symbol(parts[1]); await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1 AND symbol=$2",update.effective_user.id,symbol)
-            await q.message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে। /watchlist দিয়ে নতুন তালিকা দেখুন।"); return
+            text,kb=await watchlist_view(update.effective_user.id)
+            await q.edit_message_text(text,reply_markup=kb)
+            notice=await q.message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে।")
+            asyncio.create_task(delete_message_after(notice,30)); return
         if parts[0]=="aloff" and len(parts)==2 and parts[1].isdigit():
             await BOT.db.execute("UPDATE alerts SET active=FALSE WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
-            await q.message.reply_text(f"✅ Monitoring #{parts[1]} বন্ধ করা হয়েছে। /watchlist দিয়ে নতুন তালিকা দেখুন।"); return
+            # Update the existing list in place: stopped monitoring disappears
+            # immediately and no extra confirmation message is sent.
+            text,kb=await watchlist_view(update.effective_user.id)
+            await q.edit_message_text(text,reply_markup=kb); return
         if parts[0]=="al" and len(parts)==3:
             if not BOT.db: await q.message.reply_text("Alert-এর জন্য DATABASE_URL সেট করুন।"); return
             await BOT.ensure_user(update); symbol=BOT._normalize_symbol(parts[1]); tf=BOT._normalize_tf(parts[2])
@@ -1751,16 +1764,11 @@ async def delete_alert_command(update: Update, context: ContextTypes.DEFAULT_TYP
     result=await BOT.db.execute("UPDATE alerts SET active=FALSE WHERE id=$1 AND telegram_id=$2",int(context.args[0]),update.effective_user.id)
     await update.effective_message.reply_text("✅ Alert বন্ধ করা হয়েছে।" if result.endswith("1") else "Alert পাওয়া যায়নি।")
 
-async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    assert BOT is not None
-    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
-    await BOT.ensure_user(update)
-    if context.args:
-        try:
-            symbol=BOT._normalize_symbol(context.args[0]); await BOT.db.execute("INSERT INTO watchlists VALUES($1,$2,NOW()) ON CONFLICT DO NOTHING",update.effective_user.id,symbol)
-        except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
-    rows=await BOT.db.fetch("SELECT symbol FROM watchlists WHERE telegram_id=$1 ORDER BY symbol",update.effective_user.id)
-    monitors=await BOT.db.fetch("SELECT id,symbol,timeframe,event_filter FROM alerts WHERE telegram_id=$1 AND active ORDER BY id",update.effective_user.id)
+async def watchlist_view(user_id: int) -> tuple[str,InlineKeyboardMarkup]:
+    """Build the current watchlist/monitoring message for send or in-place edit."""
+    assert BOT is not None and BOT.db
+    rows=await BOT.db.fetch("SELECT symbol FROM watchlists WHERE telegram_id=$1 ORDER BY symbol",user_id)
+    monitors=await BOT.db.fetch("SELECT id,symbol,timeframe,event_filter FROM alerts WHERE telegram_id=$1 AND active ORDER BY id",user_id)
     watch="\n".join(f"• {r['symbol']}" for r in rows) or "খালি"
     active="\n".join(f"• #{r['id']} {r['symbol']} {r['timeframe']} — {r['event_filter']}" for r in monitors) or "কোনো monitoring চালু নেই"
     buttons=[]
@@ -1770,8 +1778,19 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     for r in monitors:
         buttons.append([InlineKeyboardButton(f"📡 #{r['id']} {r['symbol']} {r['timeframe']}",callback_data=f"an|{r['symbol'].split('/')[0]}|{r['timeframe']}"),InlineKeyboardButton("⏹ Stop",callback_data=f"aloff|{r['id']}")])
     buttons.append([InlineKeyboardButton("Guide: Watchlist কীভাবে কাজ করে",callback_data="gitem|watchlist_help")])
-    kb=InlineKeyboardMarkup(buttons)
-    await update.effective_message.reply_text(f"⭐ Watchlist\n{watch}\n\n📡 চলমান Monitoring\n{active}\n\nWatchlist শুধু coin save করে; এটি নিজে notification দেয় না। Notification পেতে /monitor SUI 4h চালু করুন।\n\nযোগ: /watchlist SUI\nবাদ: /watchlist_remove SUI\nসব বাদ: /watchlist_clear\nMonitor বন্ধ: /delete_alert ID",reply_markup=kb)
+    text=f"⭐ Watchlist\n{watch}\n\n📡 চলমান Monitoring\n{active}\n\nWatchlist শুধু coin save করে; এটি নিজে notification দেয় না। Notification পেতে /monitor SUI 4h চালু করুন।\n\nযোগ: /watchlist SUI\nবাদ: /watchlist_remove SUI\nসব বাদ: /watchlist_clear\nMonitor বন্ধ: /delete_alert ID"
+    return text,InlineKeyboardMarkup(buttons)
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    await BOT.ensure_user(update)
+    if context.args:
+        try:
+            symbol=BOT._normalize_symbol(context.args[0]); await BOT.db.execute("INSERT INTO watchlists VALUES($1,$2,NOW()) ON CONFLICT DO NOTHING",update.effective_user.id,symbol)
+        except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
+    text,kb=await watchlist_view(update.effective_user.id)
+    await update.effective_message.reply_text(text,reply_markup=kb)
 
 async def watchlist_remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -1780,13 +1799,15 @@ async def watchlist_remove_command(update: Update, context: ContextTypes.DEFAULT
     try: symbol=BOT._normalize_symbol(context.args[0])
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
     result=await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1 AND symbol=$2",update.effective_user.id,symbol)
-    await update.effective_message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে।" if result.endswith("1") else f"{symbol} watchlist-এ ছিল না।")
+    notice=await update.effective_message.reply_text(f"✅ {symbol} watchlist থেকে বাদ দেওয়া হয়েছে।" if result.endswith("1") else f"{symbol} watchlist-এ ছিল না।")
+    asyncio.create_task(delete_message_after(notice,30))
 
 async def watchlist_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context; assert BOT is not None
     if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
     result=await BOT.db.execute("DELETE FROM watchlists WHERE telegram_id=$1",update.effective_user.id)
-    await update.effective_message.reply_text(f"✅ Watchlist পরিষ্কার করা হয়েছে ({result.split()[-1]}টি coin)। চলমান monitors আলাদাভাবে active থাকবে; /alerts থেকে বন্ধ করুন।")
+    notice=await update.effective_message.reply_text(f"✅ Watchlist পরিষ্কার করা হয়েছে ({result.split()[-1]}টি coin)। চলমান monitors আলাদাভাবে active থাকবে; /alerts থেকে বন্ধ করুন।")
+    asyncio.create_task(delete_message_after(notice,30))
 
 async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Create persistent strong-confirmation breakout/breakdown monitoring."""
