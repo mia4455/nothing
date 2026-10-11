@@ -71,6 +71,18 @@ SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "1
 
 SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Return clear Bengali analysis. Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
 
+FUTURES_SCREENSHOT_SCHEMA = {
+    "type":"object",
+    "properties":{
+        "symbol":{"type":"string"},
+        "direction":{"type":"string","enum":["long","short"]},
+        "entry":{"type":"number"},
+        "stop":{"type":"number"},
+        "target1":{"type":"number"},
+    },
+    "required":["symbol","direction","entry","stop","target1"],
+}
+
 REQUEST_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1832,13 +1844,35 @@ async def futures_menu_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def futures_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q=update.callback_query; await q.answer(); context.user_data["fut"]={}
-    await q.message.reply_text("Step 1/6 — Send the coin symbol.\nExample: BTC or ETHUSDT\n\n/cancel to stop.")
+    await q.message.reply_text("Step 1/6 — Futures position screenshot পাঠান, অথবা coin symbol লিখুন।\n\nScreenshot দিলে Coin, Long/Short, Entry, Stop Loss ও TP1 স্বয়ংক্রিয়ভাবে পড়ে নেওয়া হবে।\nManual example: BTC or ETHUSDT\n\n/cancel to stop.")
     return FUT_SYMBOL
 
 async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int:
-    try: context.user_data["fut"]["symbol"]=BOT._normalize_symbol(update.effective_message.text)
-    except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return FUT_SYMBOL
-    await update.effective_message.reply_text("Step 2/6 — Entry price লিখুন।"); return FUT_ENTRY
+    message=update.effective_message
+    if message.photo:
+        try:
+            photo=message.photo[-1]
+            if photo.file_size and photo.file_size>10*1024*1024: raise UserInputError("Screenshot 10 MB-এর কম হতে হবে।")
+            telegram_file=await photo.get_file(); buf=io.BytesIO(); await telegram_file.download_to_memory(buf)
+            part=types.Part.from_bytes(data=buf.getvalue(),mime_type="image/jpeg")
+            prompt=("Read this crypto futures position screenshot. Extract the trading pair, explicit Long/Short side, Entry price, Stop Loss, and first Take Profit. "
+                    "For a Short position, the lower Entire TP/SL value is target1 and the higher value is stop; for Long, higher is target1 and lower is stop. "
+                    "Ignore mark price, liquidation price, PnL, leverage, margin and ROE. Return only the schema. Never guess an unreadable number.")
+            data=await BOT._gemini_json(None,[prompt,part],FUTURES_SCREENSHOT_SCHEMA)
+            symbol=BOT._normalize_symbol(str(data["symbol"])); entry=float(data["entry"]); stop=float(data["stop"]); target=float(data["target1"]); direction=str(data["direction"]).lower()
+            valid=(direction=="long" and stop<entry<target) or (direction=="short" and target<entry<stop)
+            if min(entry,stop,target)<=0 or not valid: raise UserInputError("Screenshot-এর Entry/SL/TP সম্পর্ক সঠিকভাবে যাচাই করা যায়নি।")
+            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target})
+            await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
+            return FUT_TP2
+        except UserInputError as exc:
+            await message.reply_text(f"⚠️ {exc}\nআরেকটি পরিষ্কার screenshot পাঠান অথবা coin symbol লিখে manual setup করুন।"); return FUT_SYMBOL
+        except Exception:
+            log.exception("Futures screenshot extraction failed")
+            await message.reply_text("⚠️ Screenshot পড়া যায়নি। পরিষ্কার screenshot আবার পাঠান অথবা coin symbol লিখুন।"); return FUT_SYMBOL
+    try: context.user_data["fut"]["symbol"]=BOT._normalize_symbol(message.text or "")
+    except UserInputError as exc: await message.reply_text(f"⚠️ {exc}"); return FUT_SYMBOL
+    await message.reply_text("Step 2/6 — Entry price লিখুন।"); return FUT_ENTRY
 
 async def futures_number_step(update: Update,context: ContextTypes.DEFAULT_TYPE,key:str,next_state:int,prompt:str,optional:bool=False)->int:
     raw=update.effective_message.text.strip()
@@ -2329,7 +2363,7 @@ def main() -> None:
     futures_conversation=ConversationHandler(
         entry_points=[CommandHandler("futures",futures_menu_command),CallbackQueryHandler(futures_add_start,pattern="^futadd$")],
         states={
-            FUT_SYMBOL:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_symbol)],
+            FUT_SYMBOL:[MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO,futures_symbol)],
             FUT_ENTRY:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_entry)],
             FUT_STOP:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_stop)],
             FUT_TP1:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_tp1)],
