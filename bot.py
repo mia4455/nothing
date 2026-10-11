@@ -1195,8 +1195,8 @@ def _card_font(size: int,bold: bool=False) -> Any:
 
 def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
     """Render a reference-inspired price card entirely in memory."""
-    # Match the user's reference card canvas and proportions exactly.
-    w,h=1536,672; up=change>=0; accent=(0,255,20) if up else (255,38,42)
+    # Wide Telegram-preview ratio: the full card stays readable without opening it.
+    w,h=1600,480; up=change>=0; accent=(0,255,20) if up else (255,38,42)
     # Use the clean reference-derived neon background shipped with the project.
     # Fall back safely if an incomplete deployment omits the asset.
     root=os.path.dirname(os.path.abspath(__file__))
@@ -1215,21 +1215,25 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
         log.warning("Price-card background unavailable (%s); using dark fallback",exc)
         img=Image.new("RGB",(w,h),(3,7,28))
     d=ImageDraw.Draw(img,"RGBA")
-    # Reference-matched title, badge, price and watermark placement.
-    base=symbol.split('/')[0]; d.ellipse((38,28,140,130),fill=(210,145,28,255),outline=(255,220,110,255),width=5)
-    badge=base[:3]; badge_font=_card_font(27,True); bb=d.textbbox((0,0),badge,font=badge_font)
-    d.text((89-(bb[2]-bb[0])/2,79-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
-    d.text((148,43),f"{name.upper()} ({base})",font=_card_font(51,True),fill="white",stroke_width=1,stroke_fill="white")
+    # Compact title and five candles leave a centered, unobstructed price.
+    base=symbol.split('/')[0]; d.ellipse((35,24,125,114),fill=(210,145,28,255),outline=(255,220,110,255),width=4)
+    badge=base[:3]; badge_font=_card_font(23,True); bb=d.textbbox((0,0),badge,font=badge_font)
+    d.text((80-(bb[2]-bb[0])/2,69-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
+    d.text((145,35),f"{name.upper()} ({base})",font=_card_font(43,True),fill="white",stroke_width=1,stroke_fill="white")
     price_text=f"${price:.8f}".rstrip("0").rstrip(".")
     if price>=100: price_text=f"${price:.2f}"
-    d.text((225,174),price_text,font=_card_font(148,True),fill=accent,stroke_width=2,stroke_fill=accent)
-    d.text((430,360),PRICE_CARD_BRAND,font=_card_font(44,True),fill=(235,235,240),stroke_width=1,stroke_fill=(235,235,240))
-    # Last ten real 15-minute candles on the reference's right-side grid.
-    chart=(895,42,1500,620); x0,y0,x1,y1=chart
-    last=candles[-10:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
+    price_font=_card_font(120,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
+    # Center around x=720, safely left of the candle panel.
+    price_x=720-(pb[2]-pb[0])/2
+    d.text((price_x,142),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
+    brand_font=_card_font(34,False); wb=d.textbbox((0,0),PRICE_CARD_BRAND,font=brand_font)
+    d.text((720-(wb[2]-wb[0])/2,320),PRICE_CARD_BRAND,font=brand_font,fill=(235,235,240))
+    # Five real 15-minute candles remain fully visible in Telegram's chat preview.
+    chart=(1160,35,1545,440); x0,y0,x1,y1=chart
+    last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
     scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
-    step=(x1-x0)/max(10,len(last)); body=max(12,int(step*.52))
+    step=(x1-x0)/max(1,len(last)); body=max(16,int(step*.48))
     for i,c in enumerate(last):
         o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
         d.line((cx,scale(high),cx,scale(low)),fill=color,width=5)
@@ -1264,12 +1268,26 @@ async def price_alert_off_command(update: Update,context: ContextTypes.DEFAULT_T
     await update.effective_message.reply_text("✅ বন্ধ করা হয়েছে।" if result.endswith("1") else "Active alert পাওয়া যায়নি।")
 
 
+def price_alert_list_ui(rows: list[Any]) -> tuple[str,InlineKeyboardMarkup | None]:
+    if not rows: return "কোনো channel price alert নেই।",None
+    lines=["Channel Price Alerts","Button চাপলে একই list-এ ON/OFF পরিবর্তন হবে।"]
+    buttons=[]
+    for r in rows:
+        status="ON" if r['enabled'] else "OFF"
+        lines.append(f"\n{r['symbol']} — {r['interval_minutes']}m — {status}")
+        # Button shows the action that will happen when pressed.
+        action="OFF" if r['enabled'] else "ON"
+        buttons.append([InlineKeyboardButton(f"{r['symbol']}  •  Turn {action}",callback_data=f"patoggle|{r['id']}")])
+    return "\n".join(lines),InlineKeyboardMarkup(buttons)
+
+
 async def price_alerts_command(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
     del context; assert BOT is not None
     if update.effective_user.id not in ADMIN_IDS: return
     if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
-    rows=await BOT.db.fetch("SELECT symbol,interval_minutes,enabled,last_sent_at FROM channel_price_alerts ORDER BY symbol")
-    await update.effective_message.reply_text("\n".join(f"{r['symbol']} — {r['interval_minutes']}m — {'ON' if r['enabled'] else 'OFF'}" for r in rows) or "কোনো channel price alert নেই।")
+    rows=await BOT.db.fetch("SELECT id,symbol,interval_minutes,enabled,last_sent_at FROM channel_price_alerts ORDER BY symbol")
+    text,kb=price_alert_list_ui(rows)
+    await update.effective_message.reply_text(text,reply_markup=kb)
 
 
 async def market_cap_answer(message: Message,text: str) -> None:
@@ -1395,6 +1413,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not public_callback and not await BOT.has_access(update.effective_user.id):
         await deny_unapproved(update,context); return
     try:
+        if parts[0]=="patoggle" and len(parts)==2:
+            if update.effective_user.id not in ADMIN_IDS: await q.answer("Admin only",show_alert=True); return
+            if not BOT.db: await q.answer("DATABASE_URL সেট করা নেই",show_alert=True); return
+            await BOT.db.execute("UPDATE channel_price_alerts SET enabled=NOT enabled,last_sent_at=CASE WHEN enabled THEN last_sent_at ELSE NULL END WHERE id=$1",int(parts[1]))
+            rows=await BOT.db.fetch("SELECT id,symbol,interval_minutes,enabled,last_sent_at FROM channel_price_alerts ORDER BY symbol")
+            text,kb=price_alert_list_ui(rows)
+            await q.edit_message_text(text,reply_markup=kb); return
         if data.startswith("adm") or data=="adminhome":
             if update.effective_user.id not in ADMIN_IDS: await q.message.reply_text("অনুমতি নেই।"); return
             if not BOT.db: await q.message.reply_text("DATABASE_URL সেট করা নেই।"); return
@@ -2086,7 +2111,7 @@ PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("gu
  BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
  BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("backtest","Backtest"),
  BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("performance","Paper performance"),BotCommand("dashboard","Monitoring dashboard"),BotCommand("risk","Position size")]
-ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alert_off","Channel price card OFF"),BotCommand("price_alerts","Channel price card list"),BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
+ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
