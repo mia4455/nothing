@@ -1174,7 +1174,8 @@ def _card_font(size: int,bold: bool=False) -> Any:
     try:
         # Matplotlib ships DejaVu inside the locked wheel, so this works even
         # in Railway's minimal container where /usr/share/fonts is absent.
-        candidates.append(font_manager.findfont("DejaVu Sans",fallback_to_default=True))
+        prop=font_manager.FontProperties(family="DejaVu Sans",weight="bold" if bold else "normal")
+        candidates.append(font_manager.findfont(prop,fallback_to_default=True))
     except Exception: pass
     for path in candidates:
         try:
@@ -1190,8 +1191,17 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
     w,h=1600,700; up=change>=0; accent=(0,255,25) if up else (255,42,45)
     # Use the clean reference-derived neon background shipped with the project.
     # Fall back safely if an incomplete deployment omits the asset.
-    asset=os.path.join(os.path.dirname(os.path.abspath(__file__)),"assets","price_card_background.jpg")
+    root=os.path.dirname(os.path.abspath(__file__))
+    # Accept both folder spellings. The user's GitHub repository currently uses
+    # `asset/`, while packaged projects conventionally use `assets/`.
+    asset_candidates=[
+        os.path.join(root,"assets","price_card_background.jpg"),
+        os.path.join(root,"asset","price_card_background.jpg"),
+        os.path.join(root,"price_card_background.jpg"),
+    ]
+    asset=next((p for p in asset_candidates if os.path.isfile(p)),"")
     try:
+        if not asset: raise FileNotFoundError("price_card_background.jpg not found in asset/ or assets/")
         img=Image.open(asset).convert("RGB").resize((w,h),Image.Resampling.LANCZOS)
     except Exception as exc:
         log.warning("Price-card background unavailable (%s); using dark fallback",exc)
@@ -1960,8 +1970,11 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             change=float(ticker.get('percentage') or 0); candles=await BOT.exchange.fetch_ohlcv(symbol,"15m",limit=10)
             base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
             card=make_price_card(symbol,name,price,change,candles)
-            caption=f"{name} ({symbol.split('/')[0]}) — ${price:,.8f}".rstrip('0').rstrip('.')
-            await context.bot.send_photo(chat_id=PRICE_ALERT_CHANNEL_ID,photo=card,caption=caption)
+            price_text=f"${price:,.8f}".rstrip('0').rstrip('.')
+            if price>=100: price_text=f"${price:,.2f}"
+            price_tag=f"@{base.lower()}_price"
+            caption=f'📈 {price_text} <a href="https://t.me/tmmusa73">{price_tag}</a>'
+            await context.bot.send_photo(chat_id=PRICE_ALERT_CHANNEL_ID,photo=card,caption=caption,parse_mode=ParseMode.HTML)
             await BOT.db.execute("UPDATE channel_price_alerts SET last_sent_at=NOW() WHERE id=$1",row['id'])
         except Exception as exc: log.exception("Channel price card failed for %s: %s",row['symbol'],exc)
 
