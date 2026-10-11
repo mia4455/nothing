@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from dotenv import load_dotenv
 from pro_quant import position_size, snapshot as professional_snapshot
 from pro_features import TTLCache, data_quality, event_fingerprint, explainable_score, retest_state
@@ -63,6 +64,8 @@ PRO_30_PRICE = os.getenv("PRO_30_PRICE", "Contact admin").strip()
 PRO_90_PRICE = os.getenv("PRO_90_PRICE", "Contact admin").strip()
 ADMIN_CONTACT_NAME = os.getenv("ADMIN_CONTACT_NAME", "—͞Tᴍ Mᴜsᴀ").strip()
 ADMIN_CONTACT_USERNAME = os.getenv("ADMIN_CONTACT_USERNAME", "tmmusa73").strip().lstrip("@")
+PRICE_ALERT_CHANNEL_ID = os.getenv("PRICE_ALERT_CHANNEL_ID", "").strip()
+PRICE_CARD_BRAND = os.getenv("PRICE_CARD_BRAND", "@cryptoaiteacherbot").strip()
 SUPPORTED_TF = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
 
 SYSTEM_INSTRUCTION = """You are a disciplined crypto technical analyst. Analyze ONLY the data supplied by the application; never invent prices, news or unstated live data. Return clear Bengali analysis. Explain R1/R2/R3, S1/S2/S3, market structure, breakout state, confirmation, invalidation and conditional considerations. Never promise profit. The analysis_bn value must be clean plain text: do not use Markdown, asterisks, hashtags, backticks, tables, HTML, decorative separators or code fences. Use short titled sections, normal line breaks and the bullet character • only. Trendline indices are zero-based candle positions and must be inside the supplied array. Output strictly one JSON object matching the requested schema, with no surrounding commentary."""
@@ -341,6 +344,11 @@ class AnalystBot:
                   chat_id BIGINT NOT NULL, sent_24h BOOLEAN DEFAULT FALSE, sent_1h BOOLEAN DEFAULT FALSE,
                   sent_10m BOOLEAN DEFAULT FALSE, active BOOLEAN DEFAULT TRUE,
                   created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(telegram_id,event_id));
+                CREATE TABLE IF NOT EXISTS channel_price_alerts(
+                  id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL UNIQUE,
+                  interval_minutes INTEGER NOT NULL CHECK(interval_minutes BETWEEN 5 AND 1440),
+                  enabled BOOLEAN NOT NULL DEFAULT TRUE, last_sent_at TIMESTAMPTZ,
+                  created_by BIGINT, created_at TIMESTAMPTZ DEFAULT NOW());
                 CREATE TABLE IF NOT EXISTS admin_audit_log(
                   id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
                   target_user_id BIGINT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
@@ -843,7 +851,7 @@ def guide_submenu(section: str) -> InlineKeyboardMarkup:
       "analysis":[("Text analysis","text"),("Voice analysis","voice"),("Timeframes","timeframes"),("Report modes","reports")],
       "alerts":[("Create alert","create_alert"),("Alert types","alert_types"),("Manage alerts","manage_alerts"),("Retest alerts","retest_alerts")],
       "charts":[("TradingView ও Pine Script","tradingview"),("Refresh","refresh"),("1H / 4H / 1D","chart_tf"),("History","history"),("Settings button","chart_settings")],
-      "research":[("Market scanner","scanner"),("News ও events","events_help"),("Backtest","backtest"),("History scan","history_scan"),("Data quality","quality")],
+      "research":[("Market scanner","scanner"),("Latest crypto news","events_help"),("Backtest","backtest"),("History scan","history_scan"),("Data quality","quality")],
       "risk":[("Position size","position"),("Confirmation modes","confirmation"),("Risk warning","risk_warning"),("Setup score","score")],
       "settings":[("Quick report","quick"),("Professional report","professional"),("Timezone","timezone"),("Language","language")],
     }
@@ -867,7 +875,7 @@ GUIDE_DETAILS={
  "history":"Chart-এর History button সাম্প্রতিক confirmed/false breakout events ও levels দেখায়।",
  "chart_settings":"Settings button থেকে report detail, Aggressive/Balanced/Conservative confirmation এবং language নির্বাচন করুন।",
  "scanner":"/scanner 4h top-volume USDT markets scan করে সম্ভাব্য breakout candidates rank করে। Score probability নয়।",
- "events_help":"/events BTC দিলে BTC-এর upcoming scheduled events এবং fresh RSS news দেখাবে। /events all পুরো market context দেখায়। Admin /event_add BTC 2026-09-29T06:00:00+06:00 high Event title দিয়ে সময়-নির্ধারিত event যোগ করতে পারেন।",
+ "events_help":"Text-এ BTC news বা সব crypto news লিখলে multiple free RSS source-এর সর্বশেষ headline, সংক্ষিপ্ত মূল কথা, source link ও market hint দেখাবে। Scheduled event feature সরানো হয়েছে।",
  "backtest":"/backtest BTC 4h historical rules test করে। ফল ভবিষ্যৎ লাভের নিশ্চয়তা নয় এবং fees/slippage assumptions পড়তে হবে।",
  "history_scan":"/history SUI 4h আগের breakout, breakdown, volume ও follow-through দেখায়।",
  "quality":"Data-quality score spot candles, higher timeframe, futures, news এবং BTC/ETH filter availability দেখায়। Missing source অনুমান করা হয় না।",
@@ -1156,6 +1164,78 @@ async def run_request(update: Update, request: Request) -> None:
         except BadRequest:
             pass
 
+def _card_font(size: int,bold: bool=False) -> ImageFont.FreeTypeFont:
+    path="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    return ImageFont.truetype(path,size)
+
+
+def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
+    """Render a reference-inspired price card entirely in memory."""
+    w,h=1600,700; up=change>=0; accent=(0,245,45) if up else (255,45,48)
+    img=Image.new("RGB",(w,h),(3,7,28)); px=img.load()
+    for y in range(h):
+        for x in range(w):
+            glow=max(0,1-((x-w*.48)**2/(w*.7)**2+(y-h*.48)**2/(h*.8)**2))
+            px[x,y]=(int(4+12*glow),int(7+3*glow),int(28+25*glow))
+    d=ImageDraw.Draw(img,"RGBA")
+    for x in range(0,w,95): d.line((x,0,x,h),fill=(30,80,130,28),width=1)
+    for y in range(0,h,80): d.line((0,y,w,y),fill=(30,80,130,28),width=1)
+    # Coin badge and dynamic title.
+    base=symbol.split('/')[0]; d.ellipse((45,35,155,145),fill=(210,145,28,255),outline=(255,220,110,255),width=5)
+    badge=base[:3]; bb=d.textbbox((0,0),badge,font=_card_font(30,True)); d.text(((200-(bb[2]-bb[0]))/2,76),badge,font=_card_font(30,True),fill="white")
+    d.text((185,48),f"{name.upper()} ({base})",font=_card_font(53,True),fill="white")
+    price_text=f"${price:,.8f}".rstrip("0").rstrip(".")
+    if price>=100: price_text=f"${price:,.2f}"
+    d.text((270,220),price_text,font=_card_font(145,True),fill=accent)
+    d.text((530,455),PRICE_CARD_BRAND,font=_card_font(48),fill=(235,235,240))
+    # Last ten real 15-minute candles on the right.
+    chart=(1080,65,1550,625); x0,y0,x1,y1=chart
+    last=candles[-10:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
+    lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
+    scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
+    step=(x1-x0)/max(10,len(last)); body=max(12,int(step*.52))
+    for i,c in enumerate(last):
+        o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
+        d.line((cx,scale(high),cx,scale(low)),fill=color,width=5)
+        top,bottom=sorted((scale(o),scale(close))); bottom=max(bottom,top+4)
+        d.rectangle((cx-body/2,top,cx+body/2,bottom),fill=color)
+    out=io.BytesIO(); img.save(out,"PNG",optimize=True); out.seek(0); out.name=f"{base}_price.png"; return out
+
+
+async def price_alert_command(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: await update.effective_message.reply_text("এই channel publisher শুধু Admin ব্যবহার করতে পারবেন।"); return
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL ছাড়া scheduled price alert save হবে না।"); return
+    if not PRICE_ALERT_CHANNEL_ID:
+        await update.effective_message.reply_text("Railway-তে PRICE_ALERT_CHANNEL_ID সেট করুন এবং bot-কে channel admin করুন।"); return
+    if len(context.args)<2:
+        await update.effective_message.reply_text("Price Channel Alert\n\nব্যবহার: /price_alert BTC 10\nএখানে BTC হলো coin এবং 10 হলো প্রতি 10 মিনিট। Interval 5–1440 মিনিট।\nবন্ধ: /price_alert_off BTC\nতালিকা: /price_alerts"); return
+    try:
+        symbol=BOT._normalize_symbol(context.args[0]); minutes=int(context.args[1])
+        if not 5<=minutes<=1440: raise ValueError
+        live=await BOT.fetch_live_price(symbol)
+        if not live: raise UserInputError("Binance Spot price পাওয়া যায়নি।")
+        await BOT.db.execute("INSERT INTO channel_price_alerts(symbol,interval_minutes,enabled,created_by,last_sent_at) VALUES($1,$2,TRUE,$3,NULL) ON CONFLICT(symbol) DO UPDATE SET interval_minutes=EXCLUDED.interval_minutes,enabled=TRUE,last_sent_at=NULL,created_by=EXCLUDED.created_by",symbol,minutes,update.effective_user.id)
+        await update.effective_message.reply_text(f"✅ {symbol} প্রতি {minutes} মিনিটে channel price card চালু।")
+    except (ValueError,UserInputError): await update.effective_message.reply_text("সঠিক coin এবং 5–1440 মিনিট interval দিন। উদাহরণ: /price_alert BTC 10")
+
+
+async def price_alert_off_command(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not BOT.db or not context.args: await update.effective_message.reply_text("ব্যবহার: /price_alert_off BTC"); return
+    symbol=BOT._normalize_symbol(context.args[0]); result=await BOT.db.execute("UPDATE channel_price_alerts SET enabled=FALSE WHERE symbol=$1",symbol)
+    await update.effective_message.reply_text("✅ বন্ধ করা হয়েছে।" if result.endswith("1") else "Active alert পাওয়া যায়নি।")
+
+
+async def price_alerts_command(update: Update,context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context; assert BOT is not None
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not BOT.db: await update.effective_message.reply_text("DATABASE_URL সেট করা নেই।"); return
+    rows=await BOT.db.fetch("SELECT symbol,interval_minutes,enabled,last_sent_at FROM channel_price_alerts ORDER BY symbol")
+    await update.effective_message.reply_text("\n".join(f"{r['symbol']} — {r['interval_minutes']}m — {'ON' if r['enabled'] else 'OFF'}" for r in rows) or "কোনো channel price alert নেই।")
+
+
 async def market_cap_answer(message: Message,text: str) -> None:
     """Answer coin market-cap/dominance questions from free CoinGecko data."""
     assert BOT is not None
@@ -1177,7 +1257,14 @@ async def market_cap_answer(message: Message,text: str) -> None:
         dominance=(cap/total*100) if cap and total else None
         price=row.get("current_price"); rank=row.get("market_cap_rank") or coin.get("market_cap_rank") or "?"
         dom_text=f"{dominance:.4f}%" if dominance is not None else "unavailable"
-        await message.reply_text(f"{row.get('name',ticker.upper())} ({ticker.upper()})\n\nMarket cap: ${cap:,.0f}\nGlobal dominance: {dom_text}\nMarket-cap rank: #{rank}\nPrice: ${float(price):,.8g}" if price is not None else f"{ticker.upper()}\nMarket cap: ${cap:,.0f}\nGlobal dominance: {dom_text}\nRank: #{rank}")
+        # Dominance itself is a current global market-cap share. Free CoinGecko
+        # does not provide reliable arbitrary-coin dominance candles, so the
+        # accompanying S/R chart truthfully uses Binance price candles.
+        frame=await BOT.fetch_candles(Request(req.symbol,"4h")); q=quant_snapshot(frame)
+        chart_result={"supports":[z["price"] for z in q["supports"]],"resistances":[z["price"] for z in q["resistances"]],"trendlines":q["trendlines"],"quant":q}
+        image=BOT.chart(frame,Request(req.symbol,"4h"),chart_result)
+        caption=f"{row.get('name',ticker.upper())} ({ticker.upper()})\nCurrent global dominance: {dom_text}\nMarket cap: ${cap:,.0f}\nRank: #{rank}\nPrice: ${float(price):,.8g}\n\nChart: Binance 4H price support/resistance; dominance historical chart নয়।"
+        await message.reply_photo(photo=image,caption=caption)
     except UserInputError as exc: await message.reply_text(f"⚠️ {exc}")
     except Exception as exc:
         log.warning("CoinGecko market-cap lookup failed: %s",exc)
@@ -1216,7 +1303,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             req=await BOT.parse_text(update.effective_message.text); await send_trade_plan(update.effective_message,req.symbol,req.timeframe)
         except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
         return
-    if any(x in text for x in ("dominance","ডমিনেন্স","ডমিন্যান্স","market cap","marketcap","মার্কেট ক্যাপ")):
+    if any(x in text for x in ("dominance","domination","ডমিনেন্স","ডমিন্যান্স","আধিপত্য","মার্কেট দখল","market cap","marketcap","মার্কেট ক্যাপ","प्रभुत्व","वर्चस्व","मार्केट कैप","बाजार पूंजीकरण")):
         await market_cap_answer(update.effective_message,update.effective_message.text); return
     if any(x in text for x in ("খবর","নিউজ","news","মিটিং","meeting","প্রোগ্রাম","program","event","ইভেন্ট","ভাষণ","speech")):
         generic=any(x in text for x in ("পুরো ক্রিপ্টো","crypto market","সব খবর","all crypto"))
@@ -1675,25 +1762,14 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     all_market=raw.lower() in {"all","crypto","market","সব"}
     try: symbol=None if all_market else BOT._normalize_symbol(raw)
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return
-    settings=await BOT.user_settings(update.effective_user.id); from zoneinfo import ZoneInfo
-    tz=ZoneInfo(settings["timezone"]); rows=[]
-    if BOT.db:
-        if symbol: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() AND (symbol=$1 OR symbol='ALL') ORDER BY starts_at LIMIT 20",symbol)
-        else: rows=await BOT.db.fetch("SELECT * FROM market_events WHERE active AND starts_at>=NOW() ORDER BY starts_at LIMIT 20")
+    settings=await BOT.user_settings(update.effective_user.id)
     request=Request(symbol or "BTC/USDT","4h"); context_data=await BOT.external_context(request,all_market=all_market)
-    lines=[f"Upcoming Crypto Events — {symbol or 'All Market'}",f"সময়: {settings['timezone']}"]
-    if rows:
-        for r in rows:
-            local=r['starts_at'].astimezone(tz); lines.append(f"\n#{r['id']} • {r['impact'].upper()}\n{local.strftime('%d %b %Y, %I:%M %p')}\n{r['symbol']} — {r['title']}"+(f"\n{r['source_url']}" if r['source_url'] else ""))
-    else: lines.append("\nDatabase-এ আসন্ন নির্ধারিত event পাওয়া যায়নি।")
+    lines=[f"Latest Crypto News — {symbol or 'All Market'}",f"সময়: {settings['timezone']}"]
     news=context_data.get("news",[])
     lines.append("\nনিচে সর্বশেষ news-এর সংক্ষিপ্ত মূল কথা ও market hint দেওয়া হয়েছে।")
     lines.append("Market Hint শিক্ষামূলক sentiment context; এটি price prediction নয়। RSS headline independently fact-checked নয়।")
     await send_long(update.effective_message,"\n".join(lines))
     await send_news_cards(update.effective_message,news[:12])
-    if rows:
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"⏰ Remind me — #{r['id']} {r['symbol']}",callback_data=f"evrem|{r['id']}")] for r in rows[:10]])
-        await update.effective_message.reply_text("Event reminder নির্বাচন করুন। ২৪ ঘণ্টা, ১ ঘণ্টা ও ১০ মিনিট আগে notification যাবে।",reply_markup=kb)
 
 async def event_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -1856,6 +1932,23 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(uid,f"🎉 আপনার Pro subscription অনুমোদিত হয়েছে।\nমেয়াদ: {days} দিন\n\n{plan_text('pro')}\n\nসব Pro command জানতে /help পাঠান।")
     except Exception: log.warning("Could not notify approved user %s",uid)
 
+async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Publish due image cards to the configured Telegram channel."""
+    assert BOT is not None
+    if not BOT.db or not PRICE_ALERT_CHANNEL_ID: return
+    rows=await BOT.db.fetch("SELECT * FROM channel_price_alerts WHERE enabled AND (last_sent_at IS NULL OR last_sent_at<=NOW()-(interval_minutes*INTERVAL '1 minute')) ORDER BY id LIMIT 10")
+    for row in rows:
+        try:
+            symbol=row['symbol']; ticker=await BOT.exchange.fetch_ticker(symbol); price=float(ticker.get('last') or ticker.get('close'))
+            change=float(ticker.get('percentage') or 0); candles=await BOT.exchange.fetch_ohlcv(symbol,"15m",limit=10)
+            base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
+            card=make_price_card(symbol,name,price,change,candles)
+            caption=f"{name} ({symbol.split('/')[0]}) — ${price:,.8f}".rstrip('0').rstrip('.')
+            await context.bot.send_photo(chat_id=PRICE_ALERT_CHANNEL_ID,photo=card,caption=caption)
+            await BOT.db.execute("UPDATE channel_price_alerts SET last_sent_at=NOW() WHERE id=$1",row['id'])
+        except Exception as exc: log.exception("Channel price card failed for %s: %s",row['symbol'],exc)
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Monitor closed candles and notify only when state changes."""
     assert BOT is not None
@@ -1952,9 +2045,9 @@ PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand(
 PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive guide"),BotCommand("settings","Report settings"),
  BotCommand("monitor","Strong breakout monitor"),BotCommand("alerts","Active monitors"),BotCommand("watchlist","Watchlist ও monitoring"),
  BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
- BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("events","Upcoming events ও news"),BotCommand("backtest","Backtest"),
+ BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("backtest","Backtest"),
  BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("performance","Paper performance"),BotCommand("dashboard","Monitoring dashboard"),BotCommand("risk","Position size")]
-ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("event_add","Scheduled event যোগ"),BotCommand("event_delete","Event সরান"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
+ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alert_off","Channel price card OFF"),BotCommand("price_alerts","Channel price card list"),BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
@@ -1972,7 +2065,7 @@ async def post_init(application: Application) -> None:
     if application.job_queue:
         application.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=20, name="breakout-alert-monitor")
         application.job_queue.run_repeating(trade_job, interval=ALERT_INTERVAL, first=35, name="paper-trade-monitor")
-        application.job_queue.run_repeating(reminder_job, interval=60, first=45, name="event-reminders")
+        application.job_queue.run_repeating(channel_price_job, interval=60, first=45, name="channel-price-cards")
         application.job_queue.run_repeating(subscription_expiry_job, interval=3600, first=60, name="subscription-expiry")
 
 async def post_shutdown(application: Application) -> None:
@@ -2010,9 +2103,9 @@ def main() -> None:
     app.add_handler(CommandHandler("risk", protected(risk_command)))
     app.add_handler(CommandHandler("backtest", protected(backtest_command)))
     app.add_handler(CommandHandler("scanner", protected(scanner_command)))
-    app.add_handler(CommandHandler("events", protected(events_command)))
-    app.add_handler(CommandHandler("event_add", event_add_command))
-    app.add_handler(CommandHandler("event_delete", event_delete_command))
+    app.add_handler(CommandHandler("price_alert", price_alert_command))
+    app.add_handler(CommandHandler("price_alert_off", price_alert_off_command))
+    app.add_handler(CommandHandler("price_alerts", price_alerts_command))
     app.add_handler(CommandHandler("timezone", protected(timezone_command)))
     app.add_handler(CommandHandler("health", protected(health_command)))
     app.add_handler(CommandHandler("alert", protected(alert_command)))
