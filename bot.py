@@ -814,7 +814,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if plan not in {"pro","admin"}:
         await deny_unapproved(update,context); return
     await update.effective_message.reply_text(
-        "👋 <b>Crypto Technical Analyst</b>\n\nCoin ও timeframe পাঠান—যেমন <code>BTC</code>, <code>SUIUSDT 4H</code>, অথবা বাংলা/ইংরেজি voice note। Timeframe না দিলে 4H।\n\nসম্পূর্ণ ব্যবহারবিধি: /guide\n⚠️ এটি শিক্ষামূলক বিশ্লেষণ, আর্থিক পরামর্শ নয়।",
+        "<b>CRYPTO AI MASTER</b>\n"
+        "Professional Crypto Market Intelligence\n\n"
+        "Send a coin and timeframe to begin.\n"
+        "Examples: <code>BTC</code>, <code>ETH 1H</code>, <code>SUIUSDT 4H</code>\n"
+        "Default timeframe: <b>4H</b>\n\n"
+        "You may also send a Bengali or English voice note.\n"
+        "Open /guide for all tools and instructions.\n\n"
+        "<i>Educational analysis only — not financial advice.</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1188,7 +1195,8 @@ def _card_font(size: int,bold: bool=False) -> Any:
 
 def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
     """Render a reference-inspired price card entirely in memory."""
-    w,h=1600,700; up=change>=0; accent=(0,255,25) if up else (255,42,45)
+    # Match the user's reference card canvas and proportions exactly.
+    w,h=1536,672; up=change>=0; accent=(0,255,20) if up else (255,38,42)
     # Use the clean reference-derived neon background shipped with the project.
     # Fall back safely if an incomplete deployment omits the asset.
     root=os.path.dirname(os.path.abspath(__file__))
@@ -1207,16 +1215,17 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
         log.warning("Price-card background unavailable (%s); using dark fallback",exc)
         img=Image.new("RGB",(w,h),(3,7,28))
     d=ImageDraw.Draw(img,"RGBA")
-    # Coin badge and dynamic title.
-    base=symbol.split('/')[0]; d.ellipse((45,35,155,145),fill=(210,145,28,255),outline=(255,220,110,255),width=5)
-    badge=base[:3]; bb=d.textbbox((0,0),badge,font=_card_font(30,True)); d.text(((200-(bb[2]-bb[0]))/2,76),badge,font=_card_font(30,True),fill="white")
-    d.text((185,48),f"{name.upper()} ({base})",font=_card_font(53,True),fill="white")
-    price_text=f"${price:,.8f}".rstrip("0").rstrip(".")
-    if price>=100: price_text=f"${price:,.2f}"
-    d.text((270,220),price_text,font=_card_font(145,True),fill=accent)
-    d.text((530,455),PRICE_CARD_BRAND,font=_card_font(48),fill=(235,235,240))
-    # Last ten real 15-minute candles on the right.
-    chart=(1080,65,1550,625); x0,y0,x1,y1=chart
+    # Reference-matched title, badge, price and watermark placement.
+    base=symbol.split('/')[0]; d.ellipse((38,28,140,130),fill=(210,145,28,255),outline=(255,220,110,255),width=5)
+    badge=base[:3]; badge_font=_card_font(27,True); bb=d.textbbox((0,0),badge,font=badge_font)
+    d.text((89-(bb[2]-bb[0])/2,79-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
+    d.text((148,43),f"{name.upper()} ({base})",font=_card_font(51,True),fill="white",stroke_width=1,stroke_fill="white")
+    price_text=f"${price:.8f}".rstrip("0").rstrip(".")
+    if price>=100: price_text=f"${price:.2f}"
+    d.text((225,174),price_text,font=_card_font(148,True),fill=accent,stroke_width=2,stroke_fill=accent)
+    d.text((430,360),PRICE_CARD_BRAND,font=_card_font(44,True),fill=(235,235,240),stroke_width=1,stroke_fill=(235,235,240))
+    # Last ten real 15-minute candles on the reference's right-side grid.
+    chart=(895,42,1500,620); x0,y0,x1,y1=chart
     last=candles[-10:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
     scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
@@ -1970,8 +1979,8 @@ async def channel_price_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             change=float(ticker.get('percentage') or 0); candles=await BOT.exchange.fetch_ohlcv(symbol,"15m",limit=10)
             base=symbol.split('/')[0]; common={"BTC":"Bitcoin","ETH":"Ethereum","BNB":"BNB","SOL":"Solana","DOGE":"Dogecoin","XRP":"XRP","ADA":"Cardano","SUI":"Sui","TRX":"TRON"}; name=common.get(base,base)
             card=make_price_card(symbol,name,price,change,candles)
-            price_text=f"${price:,.8f}".rstrip('0').rstrip('.')
-            if price>=100: price_text=f"${price:,.2f}"
+            price_text=f"${price:.8f}".rstrip('0').rstrip('.')
+            if price>=100: price_text=f"${price:.2f}"
             price_tag=f"@{base.lower()}_price"
             caption=f'📈 {price_text} <a href="https://t.me/tmmusa73">{price_tag}</a>'
             await context.bot.send_photo(chat_id=PRICE_ALERT_CHANNEL_ID,photo=card,caption=caption,parse_mode=ParseMode.HTML)
