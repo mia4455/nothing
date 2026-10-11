@@ -339,6 +339,10 @@ class AnalystBot:
                   direction TEXT NOT NULL, entry DOUBLE PRECISION NOT NULL, stop DOUBLE PRECISION NOT NULL,
                   target DOUBLE PRECISION NOT NULL, status TEXT NOT NULL DEFAULT 'active',
                   opened_at TIMESTAMPTZ DEFAULT NOW(), closed_at TIMESTAMPTZ, exit_price DOUBLE PRECISION);
+                CREATE TABLE IF NOT EXISTS paper_trade_messages(
+                  trade_id BIGINT REFERENCES paper_trades(id) ON DELETE CASCADE,
+                  chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
+                  created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY(trade_id,message_id));
                 CREATE TABLE IF NOT EXISTS breakout_events(
                   id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
                   candle_open TIMESTAMPTZ NOT NULL, candle_close TIMESTAMPTZ NOT NULL,
@@ -1474,7 +1478,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data=="futlist" or (parts[0] in {"futtoggle","futdel"} and len(parts)==2):
             if not BOT.db: await q.answer("DATABASE_URL required",show_alert=True); return
             if parts[0]=="futtoggle": await BOT.db.execute("UPDATE paper_trades SET enabled=NOT enabled WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
-            elif parts[0]=="futdel": await BOT.db.execute("UPDATE paper_trades SET status='cancelled',enabled=FALSE,closed_at=NOW() WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
+            elif parts[0]=="futdel":
+                trade_id=int(parts[1])
+                tracked=await BOT.db.fetch("SELECT m.chat_id,m.message_id FROM paper_trade_messages m JOIN paper_trades p ON p.id=m.trade_id WHERE m.trade_id=$1 AND p.telegram_id=$2",trade_id,update.effective_user.id)
+                for tracked_message in tracked:
+                    try: await context.bot.delete_message(tracked_message['chat_id'],tracked_message['message_id'])
+                    except Exception: pass
+                await BOT.db.execute("DELETE FROM paper_trade_messages WHERE trade_id=$1",trade_id)
+                await BOT.db.execute("UPDATE paper_trades SET status='cancelled',enabled=FALSE,closed_at=NOW() WHERE id=$1 AND telegram_id=$2",trade_id,update.effective_user.id)
             rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE telegram_id=$1 AND status='active' ORDER BY id ASC LIMIT 30",update.effective_user.id)
             buttons=[]; lines=["Futures Trade Manager — Active Positions"]
             for display_no,r in enumerate(rows,1):
@@ -1862,9 +1873,11 @@ async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int
             symbol=BOT._normalize_symbol(str(data["symbol"])); entry=float(data["entry"]); stop=float(data["stop"]); target=float(data["target1"]); direction=str(data["direction"]).lower()
             valid=(direction=="long" and stop<entry<target) or (direction=="short" and target<entry<stop)
             if min(entry,stop,target)<=0 or not valid: raise UserInputError("Screenshot-এর Entry/SL/TP সম্পর্ক সঠিকভাবে যাচাই করা যায়নি।")
-            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"cleanup":[]})
+            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"cleanup":[],"source_message_id":message.message_id})
             detected=await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
-            context.user_data["fut"]["cleanup"].append(detected)
+            # Schedule this independently so it is always removed even if the
+            # remaining wizard steps take longer or the conversation restarts.
+            asyncio.create_task(delete_message_after(detected,30))
             return FUT_TP2
         except UserInputError as exc:
             await message.reply_text(f"⚠️ {exc}\nআরেকটি পরিষ্কার screenshot পাঠান অথবা coin symbol লিখে manual setup করুন।"); return FUT_SYMBOL
@@ -1905,7 +1918,12 @@ async def futures_tp3(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
     await BOT.ensure_user(update)
     row=await BOT.db.fetchrow("INSERT INTO paper_trades(telegram_id,chat_id,symbol,timeframe,direction,entry,stop,target,target2,target3,enabled) VALUES($1,$2,$3,'1m',$4,$5,$6,$7,$8,$9,TRUE) RETURNING id",update.effective_user.id,update.effective_chat.id,d["symbol"],direction,entry,stop,tp1,d.get("target2"),d.get("target3"))
     display_no=await BOT.db.fetchval("SELECT count(*) FROM paper_trades WHERE telegram_id=$1 AND status='active'",update.effective_user.id)
-    await update.effective_message.reply_text(f"✅ Futures Trade #{display_no} added\n{d['symbol']} • {direction.upper()}\nEntry {entry:g} | SL {stop:g}\nTP1 {tp1:g}"+(f" | TP2 {d['target2']:g}" if d.get('target2') else "")+(f" | TP3 {d['target3']:g}" if d.get('target3') else "")+"\n\nMonitoring uses live price + closed 1m candle. Virtual alerts only.")
+    final_message=await update.effective_message.reply_text(f"✅ Futures Trade #{display_no} added\n{d['symbol']} • {direction.upper()}\nEntry {entry:g} | SL {stop:g}\nTP1 {tp1:g}"+(f" | TP2 {d['target2']:g}" if d.get('target2') else "")+(f" | TP3 {d['target3']:g}" if d.get('target3') else "")+"\n\nMonitoring uses live price + closed 1m candle. Virtual alerts only.")
+    # Keep every persistent trade-related message so Remove can clean the chat.
+    message_ids=[final_message.message_id]
+    if d.get("source_message_id"): message_ids.append(int(d["source_message_id"]))
+    for message_id in message_ids:
+        await BOT.db.execute("INSERT INTO paper_trade_messages(trade_id,chat_id,message_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",row['id'],update.effective_chat.id,message_id)
     cleanup=d.get("cleanup")
     if cleanup is not None:
         cleanup.append(update.effective_message)
@@ -2249,7 +2267,8 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             stop_hit=(low<=r['stop']) if long else (high>=r['stop'])
             if stop_hit:
                 await BOT.db.execute("UPDATE paper_trades SET status='stop_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2 AND status='active'",r['stop'],r['id'])
-                await context.bot.send_message(r['chat_id'],f"🛑 Futures Trade #{r['display_no']} — STOP LOSS HIT\n{r['symbol']} • {r['direction'].upper()}\nSL: {r['stop']:g} | Live: {live:g}\nSource: Binance live + closed 1m candle\n\nVirtual monitoring only; no real order was placed.")
+                notice=await context.bot.send_message(r['chat_id'],f"🛑 Futures Trade #{r['display_no']} — STOP LOSS HIT\n{r['symbol']} • {r['direction'].upper()}\nSL: {r['stop']:g} | Live: {live:g}\nSource: Binance live + closed 1m candle\n\nVirtual monitoring only; no real order was placed.")
+                await BOT.db.execute("INSERT INTO paper_trade_messages(trade_id,chat_id,message_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",r['id'],r['chat_id'],notice.message_id)
                 continue
             targets=[(1,r['target'],r['tp1_hit']),(2,r['target2'],r['tp2_hit']),(3,r['target3'],r['tp3_hit'])]
             for number,target,already in targets:
@@ -2257,7 +2276,8 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 hit=(high>=target) if long else (low<=target)
                 if hit:
                     await BOT.db.execute(f"UPDATE paper_trades SET tp{number}_hit=TRUE WHERE id=$1",r['id'])
-                    await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['display_no']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
+                    notice=await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['display_no']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
+                    await BOT.db.execute("INSERT INTO paper_trade_messages(trade_id,chat_id,message_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",r['id'],r['chat_id'],notice.message_id)
             last_number=3 if r['target3'] is not None else 2 if r['target2'] is not None else 1
             last_target=r['target3'] or r['target2'] or r['target']; last_hit=(high>=last_target) if long else (low<=last_target)
             if last_hit: await BOT.db.execute("UPDATE paper_trades SET status='target_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2",last_target,r['id'])
