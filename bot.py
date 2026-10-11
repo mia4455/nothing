@@ -1259,7 +1259,7 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
     # Five compact Binance-style candles on the right.
     # Begin immediately after the final price digit. Five candles occupy a
     # dense, fixed-width mini-chart like Binance/TradingView, never the title.
-    x0=int(price_right+24); x1=min(1540,x0+255); y0,y1=112,358
+    x0=int(price_right+8); x1=min(1540,x0+255); y0,y1=112,358
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,1e-12)
     inner_top=y0+43; inner_bottom=y1-43
@@ -1304,11 +1304,11 @@ def price_alert_list_ui(rows: list[Any]) -> tuple[str,InlineKeyboardMarkup | Non
     lines=["Channel Price Alerts","Button চাপলে একই list-এ ON/OFF পরিবর্তন হবে।"]
     flat_buttons=[]
     for r in rows:
-        status="ON" if r['enabled'] else "OFF"
+        status="🟢 ON" if r['enabled'] else "🔴 OFF"
         lines.append(f"{r['symbol']} — {r['interval_minutes']}m — {status}")
-        # Button shows the action that will happen when pressed.
-        action="OFF" if r['enabled'] else "ON"
-        flat_buttons.append(InlineKeyboardButton(f"{r['symbol']} • Turn {action}",callback_data=f"patoggle|{r['id']}"))
+        # Show the current state clearly; pressing the button toggles it.
+        state_label="🟢 ON" if r['enabled'] else "🔴 OFF"
+        flat_buttons.append(InlineKeyboardButton(f"{r['symbol']} • {state_label}",callback_data=f"patoggle|{r['id']}"))
     # One control per row keeps the list in a simple top-to-bottom serial order.
     buttons=[[button] for button in flat_buttons]
     return "\n".join(lines),InlineKeyboardMarkup(buttons)
