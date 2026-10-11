@@ -1247,11 +1247,13 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
     d.text((center_x-(wb[2]-wb[0])/2,350),brand,font=brand_font,fill=(220,220,230),stroke_width=1,stroke_fill=(220,220,230))
 
     # Five compact Binance-style candles on the right.
-    chart=(1180,70,1550,425); x0,y0,x1,y1=chart
+    # Start near 66% of the card (the user's marked boundary) and use the full
+    # right-side panel. Narrow bodies keep all five candles readable.
+    chart=(1060,65,1545,430); x0,y0,x1,y1=chart
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
     scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
-    step=(x1-x0)/max(1,len(last)); body=max(18,int(step*.78))
+    step=(x1-x0)/max(1,len(last)); body=max(14,int(step*.46))
     for i,c in enumerate(last):
         o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
         d.line((cx,scale(high),cx,scale(low)),fill=color,width=5)
@@ -1296,8 +1298,8 @@ def price_alert_list_ui(rows: list[Any]) -> tuple[str,InlineKeyboardMarkup | Non
         # Button shows the action that will happen when pressed.
         action="OFF" if r['enabled'] else "ON"
         flat_buttons.append(InlineKeyboardButton(f"{r['symbol']} • Turn {action}",callback_data=f"patoggle|{r['id']}"))
-    # Two compact controls per row remove the large vertical gap.
-    buttons=[flat_buttons[i:i+2] for i in range(0,len(flat_buttons),2)]
+    # One control per row keeps the list in a simple top-to-bottom serial order.
+    buttons=[[button] for button in flat_buttons]
     return "\n".join(lines),InlineKeyboardMarkup(buttons)
 
 
