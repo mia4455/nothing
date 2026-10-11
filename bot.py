@@ -42,7 +42,7 @@ from pro_features import TTLCache, data_quality, event_fingerprint, explainable_
 from telegram import BotCommand, BotCommandScopeChat, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
-from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 load_dotenv()
 logging.basicConfig(
@@ -359,6 +359,12 @@ class AnalystBot:
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_mode TEXT NOT NULL DEFAULT 'balanced'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Asia/Dhaka'")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'bn'")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target2 DOUBLE PRECISION")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target3 DOUBLE PRECISION")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp1_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp2_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp3_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notified BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry_3d_sent BOOLEAN NOT NULL DEFAULT FALSE")
@@ -543,9 +549,9 @@ REQUEST: {json.dumps(text, ensure_ascii=False)}"""
         transcript = str(data.get("transcript", "")).strip()
         return Request(self._normalize_symbol(str(data["symbol"])), self._normalize_tf(str(data.get("timeframe", "4h"))), transcript)
 
-    async def fetch_candles(self, request: Request) -> pd.DataFrame:
+    async def fetch_candles(self, request: Request, force: bool = False) -> pd.DataFrame:
         cache_key=f"ohlcv:{request.symbol}:{request.timeframe}:{CANDLE_LIMIT}"
-        cached=self.cache.get(cache_key)
+        cached=None if force else self.cache.get(cache_key)
         if cached is not None:
             return cached.copy(deep=True)
         if not self.markets_loaded:
@@ -1446,6 +1452,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not public_callback and not await BOT.has_access(update.effective_user.id):
         await deny_unapproved(update,context); return
     try:
+        if data=="futlist" or (parts[0] in {"futtoggle","futdel"} and len(parts)==2):
+            if not BOT.db: await q.answer("DATABASE_URL required",show_alert=True); return
+            if parts[0]=="futtoggle": await BOT.db.execute("UPDATE paper_trades SET enabled=NOT enabled WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
+            elif parts[0]=="futdel": await BOT.db.execute("UPDATE paper_trades SET status='cancelled',enabled=FALSE,closed_at=NOW() WHERE id=$1 AND telegram_id=$2",int(parts[1]),update.effective_user.id)
+            rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE telegram_id=$1 AND status='active' ORDER BY id DESC LIMIT 30",update.effective_user.id)
+            buttons=[]; lines=["Futures Trade Manager — Active Positions"]
+            for r in rows:
+                state="🟢 ON" if r['enabled'] else "🔴 OFF"; lines.append(f"#{r['id']} {r['symbol']} {r['direction'].upper()} — {state}\nEntry {r['entry']:g} | SL {r['stop']:g} | TP1 {r['target']:g}")
+                buttons.append([InlineKeyboardButton(f"#{r['id']} • {state}",callback_data=f"futtoggle|{r['id']}"),InlineKeyboardButton("🗑 Remove",callback_data=f"futdel|{r['id']}")])
+            buttons.append([InlineKeyboardButton("➕ Add Futures Trade",callback_data="futadd")])
+            await q.edit_message_text("\n\n".join(lines) if rows else "No active futures trades.",reply_markup=InlineKeyboardMarkup(buttons)); return
         if parts[0]=="patoggle" and len(parts)==2:
             if update.effective_user.id not in ADMIN_IDS: await q.answer("Admin only",show_alert=True); return
             if not BOT.db: await q.answer("DATABASE_URL সেট করা নেই",show_alert=True); return
@@ -1784,6 +1801,55 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.effective_message.reply_text(f"✅ Strong confirmation monitor #{row['id']} চালু\n{req.symbol} • {req.timeframe}\n\nClosed candle + volume ≥1.5x + body ≥60% হলে breakout/breakdown notification পাবেন। শতভাগ নিশ্চয়তা কোনো বাজারে সম্ভব নয়।")
     except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}")
 
+FUT_SYMBOL,FUT_ENTRY,FUT_STOP,FUT_TP1,FUT_TP2,FUT_TP3=range(60,66)
+
+async def futures_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert BOT is not None
+    if not await BOT.has_access(update.effective_user.id): await deny_unapproved(update,context); return
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Futures Trade",callback_data="futadd")],[InlineKeyboardButton("📋 Manage Trades",callback_data="futlist")]])
+    await update.effective_message.reply_text("Futures Trade Manager\n\nAdd a virtual futures position, then receive SL and TP1–TP3 notifications from Binance live price plus closed 1-minute candle data. No real order is placed.",reply_markup=kb)
+
+async def futures_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q=update.callback_query; await q.answer(); context.user_data["fut"]={}
+    await q.message.reply_text("Step 1/6 — Send the coin symbol.\nExample: BTC or ETHUSDT\n\n/cancel to stop.")
+    return FUT_SYMBOL
+
+async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int:
+    try: context.user_data["fut"]["symbol"]=BOT._normalize_symbol(update.effective_message.text)
+    except UserInputError as exc: await update.effective_message.reply_text(f"⚠️ {exc}"); return FUT_SYMBOL
+    await update.effective_message.reply_text("Step 2/6 — Entry price লিখুন।"); return FUT_ENTRY
+
+async def futures_number_step(update: Update,context: ContextTypes.DEFAULT_TYPE,key:str,next_state:int,prompt:str,optional:bool=False)->int:
+    raw=update.effective_message.text.strip()
+    if optional and raw in {"-","skip","0"}: context.user_data["fut"][key]=None
+    else:
+        try:
+            value=float(raw.replace(",","")); assert value>0; context.user_data["fut"][key]=value
+        except Exception: await update.effective_message.reply_text("Positive number দিন, অথবা optional target-এর জন্য - পাঠান।"); return next_state-1
+    await update.effective_message.reply_text(prompt); return next_state
+
+async def futures_entry(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"entry",FUT_STOP,"Step 3/6 — Stop Loss লিখুন।")
+async def futures_stop(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"stop",FUT_TP1,"Step 4/6 — Target 1 লিখুন।")
+async def futures_tp1(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"target",FUT_TP2,"Step 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
+async def futures_tp2(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"target2",FUT_TP3,"Step 6/6 — Target 3 লিখুন, না থাকলে - পাঠান।",True)
+
+async def futures_tp3(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
+    raw=update.effective_message.text.strip(); d=context.user_data["fut"]
+    try: d["target3"]=None if raw in {"-","skip","0"} else float(raw.replace(",","")); assert d["target3"] is None or d["target3"]>0
+    except Exception: await update.effective_message.reply_text("Positive number দিন অথবা - পাঠান।"); return FUT_TP3
+    entry,stop,tp1=d["entry"],d["stop"],d["target"]
+    direction="long" if stop<entry<tp1 else "short" if tp1<entry<stop else None
+    targets=[x for x in (tp1,d.get("target2"),d.get("target3")) if x is not None]
+    if not direction or (direction=="long" and targets!=sorted(targets)) or (direction=="short" and targets!=sorted(targets,reverse=True)):
+        await update.effective_message.reply_text("Invalid levels। Long: SL < Entry < TP1 < TP2 < TP3; Short-এ উল্টো। আবার /futures থেকে শুরু করুন।"); return ConversationHandler.END
+    await BOT.ensure_user(update)
+    row=await BOT.db.fetchrow("INSERT INTO paper_trades(telegram_id,chat_id,symbol,timeframe,direction,entry,stop,target,target2,target3,enabled) VALUES($1,$2,$3,'1m',$4,$5,$6,$7,$8,$9,TRUE) RETURNING id",update.effective_user.id,update.effective_chat.id,d["symbol"],direction,entry,stop,tp1,d.get("target2"),d.get("target3"))
+    await update.effective_message.reply_text(f"✅ Futures Trade #{row['id']} added\n{d['symbol']} • {direction.upper()}\nEntry {entry:g} | SL {stop:g}\nTP1 {tp1:g}"+(f" | TP2 {d['target2']:g}" if d.get('target2') else "")+(f" | TP3 {d['target3']:g}" if d.get('target3') else "")+"\n\nMonitoring uses live price + closed 1m candle. Virtual alerts only.")
+    context.user_data.pop("fut",None); return ConversationHandler.END
+
+async def futures_cancel(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
+    context.user_data.pop("fut",None); await update.effective_message.reply_text("Cancelled."); return ConversationHandler.END
+
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not BOT.db: await update.effective_message.reply_text("Trade alert-এর জন্য DATABASE_URL প্রয়োজন।"); return
@@ -2075,7 +2141,16 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     rows=await BOT.db.fetch("SELECT * FROM alerts WHERE active ORDER BY id LIMIT 100")
     for row in rows:
         try:
-            req=Request(row['symbol'],row['timeframe']); frame=await BOT.fetch_candles(req); q=quant_snapshot(frame); state=q['breakout']['state']; candle=frame.index[-1].isoformat()
+            req=Request(row['symbol'],row['timeframe']); frame,live=await asyncio.gather(BOT.fetch_candles(req,force=True),BOT.fetch_live_price(req.symbol)); q=quant_snapshot(frame); state=q['breakout']['state']; candle=frame.index[-1].isoformat()
+            # Confirmed states remain closed-candle only. Otherwise use the live
+            # ticker to provide timely approaching alerts without falsely calling
+            # an intrabar wick a confirmed breakout.
+            live_price=float(live.get('price') or q['last']); bo=q['breakout']
+            if "CONFIRMED" not in state:
+                up_distance=(float(bo['bullish_trigger'])-live_price)/live_price*100
+                down_distance=(live_price-float(bo['bearish_trigger']))/live_price*100
+                if up_distance<=1.0 and up_distance<=down_distance: state="APPROACHING_BREAKOUT"
+                elif down_distance<=1.0: state="APPROACHING_BREAKDOWN"
             retest=retest_state(frame,q['breakout']); event_state=retest['state'] if retest['state'] not in {"NOT_APPLICABLE","NO_RETEST_DATA","WAITING_FOR_RETEST"} else state
             category=("retest" if "RETEST" in event_state else "confirmed" if "CONFIRMED" in event_state else "false" if "FALSE" in event_state else "approaching" if "APPROACHING" in event_state else "volume" if q['breakout']['volume_ratio']>=2 else None)
             strong=("CONFIRMED" in event_state and q['breakout']['volume_ratio']>=1.5 and q['breakout']['body_strength']>=.60)
@@ -2090,8 +2165,8 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await BOT.db.execute("""INSERT INTO breakout_events(symbol,timeframe,candle_open,candle_close,event_type,level,close_price,volume_ratio,body_strength)
                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING""",req.symbol,req.timeframe,opened,closed,normalized_type,level,q['last'],q['breakout']['volume_ratio'],q['breakout']['body_strength'])
             if wanted and fingerprint != row['last_fingerprint'] and event_state != row['last_state']:
-                bo=q['breakout']; live=await BOT.fetch_live_price(req.symbol)
-                live_line=f"বর্তমান Binance price: {live['price']:.8g}\n" if live else ""
+                bo=q['breakout']
+                live_line=f"বর্তমান Binance price: {live_price:.8g}\n"
                 await context.bot.send_message(row['chat_id'],f"🚨 {req.symbol} • {req.timeframe}\nEvent: {colored_state(event_state)}\n{live_line}Signal closed candle: {candle[:16]} UTC\nSignal close: {q['last']:.8g}\nBull trigger: {bo['bullish_trigger']:.8g}\nBear trigger: {bo['bearish_trigger']:.8g}\nVolume: {bo['volume_ratio']:.2f}x\n\nConfirmation closed candle-এর; live price শুধু বর্তমান reference। এটি আর্থিক পরামর্শ নয়।")
             await BOT.db.execute("UPDATE alerts SET last_state=$1,last_candle=$2,last_fingerprint=$3 WHERE id=$4",event_state,candle,fingerprint,row['id'])
         except Exception: log.exception("Alert check failed id=%s",row['id'])
@@ -2100,22 +2175,28 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not BOT.db: return
-    rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE status='active' ORDER BY id LIMIT 100")
+    rows=await BOT.db.fetch("SELECT * FROM paper_trades WHERE status='active' AND enabled ORDER BY id LIMIT 100")
     for r in rows:
         try:
-            frame=await BOT.fetch_candles(Request(r['symbol'],r['timeframe'])); candle=frame.iloc[-1]; outcome=None; exit_price=None
-            if r['direction']=="long":
-                # Conservative ordering when both occur in one OHLC candle.
-                if candle.Low<=r['stop']: outcome,exit_price="stop_hit",r['stop']
-                elif candle.High>=r['target']: outcome,exit_price="target_hit",r['target']
-            else:
-                if candle.High>=r['stop']: outcome,exit_price="stop_hit",r['stop']
-                elif candle.Low<=r['target']: outcome,exit_price="target_hit",r['target']
-            if outcome:
-                await BOT.db.execute("UPDATE paper_trades SET status=$1,exit_price=$2,closed_at=NOW() WHERE id=$3 AND status='active'",outcome,exit_price,r['id'])
-                icon="🎯" if outcome=="target_hit" else "🛑"
-                await context.bot.send_message(r['chat_id'],f"{icon} Paper trade #{r['id']} — {outcome.replace('_',' ').title()}\n{r['symbol']} • {r['timeframe']}\nExit: {exit_price:.8g}\nClosed candle: {frame.index[-1].isoformat()[:16]}\n\nএটি virtual monitoring; real order execute হয়নি।")
-        except Exception: log.exception("Trade monitor failed id=%s",r['id'])
+            ticker,candles=await asyncio.gather(BOT.fetch_live_price(r['symbol']),BOT.exchange.fetch_ohlcv(r['symbol'],'1m',limit=2))
+            live=float(ticker.get('price') or 0); closed=candles[-2] if len(candles)>1 else candles[-1]
+            high=max(live,float(closed[2])); low=min(live,float(closed[3])); long=r['direction']=="long"
+            stop_hit=(low<=r['stop']) if long else (high>=r['stop'])
+            if stop_hit:
+                await BOT.db.execute("UPDATE paper_trades SET status='stop_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2 AND status='active'",r['stop'],r['id'])
+                await context.bot.send_message(r['chat_id'],f"🛑 Futures Trade #{r['id']} — STOP LOSS HIT\n{r['symbol']} • {r['direction'].upper()}\nSL: {r['stop']:g} | Live: {live:g}\nSource: Binance live + closed 1m candle\n\nVirtual monitoring only; no real order was placed.")
+                continue
+            targets=[(1,r['target'],r['tp1_hit']),(2,r['target2'],r['tp2_hit']),(3,r['target3'],r['tp3_hit'])]
+            for number,target,already in targets:
+                if target is None or already: continue
+                hit=(high>=target) if long else (low<=target)
+                if hit:
+                    await BOT.db.execute(f"UPDATE paper_trades SET tp{number}_hit=TRUE WHERE id=$1",r['id'])
+                    await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['id']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
+            last_number=3 if r['target3'] is not None else 2 if r['target2'] is not None else 1
+            last_target=r['target3'] or r['target2'] or r['target']; last_hit=(high>=last_target) if long else (low<=last_target)
+            if last_hit: await BOT.db.execute("UPDATE paper_trades SET status='target_hit',exit_price=$1,closed_at=NOW(),enabled=FALSE WHERE id=$2",last_target,r['id'])
+        except Exception: log.exception("Futures trade monitor failed id=%s",r['id'])
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -2164,9 +2245,8 @@ PUBLIC_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand(
 PRO_COMMANDS=[BotCommand("start","Bot শুরু করুন"),BotCommand("guide","Interactive guide"),BotCommand("settings","Report settings"),
  BotCommand("monitor","Strong breakout monitor"),BotCommand("alerts","Active monitors"),BotCommand("watchlist","Watchlist ও monitoring"),
  BotCommand("watchlist_remove","Watchlist থেকে coin বাদ"),BotCommand("watchlist_clear","Watchlist পরিষ্কার"),
- BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("backtest","Backtest"),
- BotCommand("trade","Paper trade SL/TP alert"),BotCommand("trades","Active paper trades"),BotCommand("performance","Paper performance"),BotCommand("dashboard","Monitoring dashboard"),BotCommand("risk","Position size")]
-ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("user","User search"),BotCommand("health","System health"),BotCommand("stats","System statistics")]
+ BotCommand("scanner","Breakout candidates"),BotCommand("history","Breakout history"),BotCommand("futures","Futures Trade Manager")]
+ADMIN_COMMANDS=PRO_COMMANDS+[BotCommand("price_alert","Channel price card ON/Update"),BotCommand("price_alerts","Channel price card ON/OFF list"),BotCommand("admin","Admin panel"),BotCommand("stats","System statistics")]
 
 async def set_user_menu(bot: Any,user_id:int,plan:str) -> None:
     commands=ADMIN_COMMANDS if plan=="admin" else PRO_COMMANDS if plan=="pro" else PUBLIC_COMMANDS
@@ -2182,8 +2262,8 @@ async def post_init(application: Application) -> None:
         for row in rows: await set_user_menu(application.bot,row['telegram_id'],"pro")
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     if application.job_queue:
-        application.job_queue.run_repeating(alert_job, interval=ALERT_INTERVAL, first=20, name="breakout-alert-monitor")
-        application.job_queue.run_repeating(trade_job, interval=ALERT_INTERVAL, first=35, name="paper-trade-monitor")
+        application.job_queue.run_repeating(alert_job, interval=60, first=20, name="breakout-alert-monitor")
+        application.job_queue.run_repeating(trade_job, interval=60, first=35, name="paper-trade-monitor")
         application.job_queue.run_repeating(channel_price_job, interval=60, first=45, name="channel-price-cards")
         application.job_queue.run_repeating(subscription_expiry_job, interval=3600, first=60, name="subscription-expiry")
 
@@ -2225,6 +2305,17 @@ def main() -> None:
     app.add_handler(CommandHandler("price_alert", price_alert_command))
     app.add_handler(CommandHandler("price_alert_off", price_alert_off_command))
     app.add_handler(CommandHandler("price_alerts", price_alerts_command))
+    futures_conversation=ConversationHandler(
+        entry_points=[CommandHandler("futures",futures_menu_command),CallbackQueryHandler(futures_add_start,pattern="^futadd$")],
+        states={
+            FUT_SYMBOL:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_symbol)],
+            FUT_ENTRY:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_entry)],
+            FUT_STOP:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_stop)],
+            FUT_TP1:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_tp1)],
+            FUT_TP2:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_tp2)],
+            FUT_TP3:[MessageHandler(filters.TEXT & ~filters.COMMAND,futures_tp3)],
+        },fallbacks=[CommandHandler("cancel",futures_cancel)],allow_reentry=True)
+    app.add_handler(futures_conversation)
     app.add_handler(CommandHandler("timezone", protected(timezone_command)))
     app.add_handler(CommandHandler("health", protected(health_command)))
     app.add_handler(CommandHandler("alert", protected(alert_command)))
