@@ -31,6 +31,7 @@ from google.genai import types
 import matplotlib
 matplotlib.use("Agg")  # Required on headless Railway containers.
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
@@ -1164,9 +1165,24 @@ async def run_request(update: Update, request: Request) -> None:
         except BadRequest:
             pass
 
-def _card_font(size: int,bold: bool=False) -> ImageFont.FreeTypeFont:
-    path="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    return ImageFont.truetype(path,size)
+def _card_font(size: int,bold: bool=False) -> Any:
+    """Load a portable font from Matplotlib; Railway may have no system fonts."""
+    candidates=[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    try:
+        # Matplotlib ships DejaVu inside the locked wheel, so this works even
+        # in Railway's minimal container where /usr/share/fonts is absent.
+        candidates.append(font_manager.findfont("DejaVu Sans",fallback_to_default=True))
+    except Exception: pass
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path): return ImageFont.truetype(path,size)
+        except OSError: continue
+    log.warning("No scalable font found; using Pillow built-in fallback")
+    try: return ImageFont.load_default(size=size)
+    except TypeError: return ImageFont.load_default()
 
 
 def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
