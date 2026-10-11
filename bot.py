@@ -1854,8 +1854,11 @@ async def futures_menu_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.effective_message.reply_text("Futures Trade Manager\n\nAdd a virtual futures position, then receive SL and TP1–TP3 notifications from Binance live price plus closed 1-minute candle data. No real order is placed.",reply_markup=kb)
 
 async def futures_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q=update.callback_query; await q.answer(); context.user_data["fut"]={}
-    await q.message.reply_text("Step 1/6 — Futures position screenshot পাঠান, অথবা coin symbol লিখুন।\n\nScreenshot দিলে Coin, Long/Short, Entry, Stop Loss ও TP1 স্বয়ংক্রিয়ভাবে পড়ে নেওয়া হবে।\nManual example: BTC or ETHUSDT\n\n/cancel to stop.")
+    q=update.callback_query; await q.answer()
+    prompt=await q.message.reply_text("Step 1/6 — Futures position screenshot পাঠান, অথবা coin symbol লিখুন।\n\nScreenshot দিলে Coin, Long/Short, Entry, Stop Loss ও TP1 স্বয়ংক্রিয়ভাবে পড়ে নেওয়া হবে।\nManual example: BTC or ETHUSDT\n\n/cancel to stop.")
+    # Keep the opening instruction with the wizard's temporary messages; it is
+    # removed 30 seconds after a screenshot trade is successfully added.
+    context.user_data["fut"]={"cleanup":[prompt]}
     return FUT_SYMBOL
 
 async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int:
@@ -1873,7 +1876,7 @@ async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int
             symbol=BOT._normalize_symbol(str(data["symbol"])); entry=float(data["entry"]); stop=float(data["stop"]); target=float(data["target1"]); direction=str(data["direction"]).lower()
             valid=(direction=="long" and stop<entry<target) or (direction=="short" and target<entry<stop)
             if min(entry,stop,target)<=0 or not valid: raise UserInputError("Screenshot-এর Entry/SL/TP সম্পর্ক সঠিকভাবে যাচাই করা যায়নি।")
-            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"cleanup":[],"source_message_id":message.message_id})
+            context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"source_message_id":message.message_id})
             detected=await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
             # Schedule this independently so it is always removed even if the
             # remaining wizard steps take longer or the conversation restarts.
