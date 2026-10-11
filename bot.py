@@ -1247,17 +1247,20 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
     d.text((center_x-(wb[2]-wb[0])/2,350),brand,font=brand_font,fill=(220,220,230),stroke_width=1,stroke_fill=(220,220,230))
 
     # Five compact Binance-style candles on the right.
-    # Start near 66% of the card (the user's marked boundary) and use the full
-    # right-side panel. Narrow bodies keep all five candles readable.
-    chart=(1060,65,1545,430); x0,y0,x1,y1=chart
+    # Compact reference-style candle cluster: five small candles begin near 65%
+    # of the card and finish early, leaving deliberate empty space on the right.
+    chart=(1040,90,1360,365); x0,y0,x1,y1=chart
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
-    scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
-    step=(x1-x0)/max(1,len(last)); body=max(14,int(step*.46))
+    # Compress the market range into the middle 62% vertically so a volatile
+    # candle can never become an oversized block in the Telegram preview.
+    inner_top=y0+52; inner_bottom=y1-52
+    scale=lambda v: inner_bottom-(float(v)-lo)/span*(inner_bottom-inner_top)
+    step=(x1-x0)/max(1,len(last)); body=max(12,int(step*.43))
     for i,c in enumerate(last):
         o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
-        d.line((cx,scale(high),cx,scale(low)),fill=color,width=5)
-        top,bottom=sorted((scale(o),scale(close))); bottom=max(bottom,top+4)
+        d.line((cx,scale(high),cx,scale(low)),fill=color,width=3)
+        top,bottom=sorted((scale(o),scale(close))); bottom=max(bottom,top+3)
         d.rectangle((cx-body/2,top,cx+body/2,bottom),fill=color)
     out=io.BytesIO(); img.save(out,"PNG",optimize=True); out.seek(0); out.name=f"{base}_price.png"; return out
 
