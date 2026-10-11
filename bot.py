@@ -380,6 +380,9 @@ class AnalystBot:
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp1_hit BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp2_hit BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp3_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS pre_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS pre_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE")
+            await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS pre_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notified BOOLEAN NOT NULL DEFAULT FALSE")
             await con.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE")
@@ -1850,15 +1853,32 @@ FUT_SYMBOL,FUT_ENTRY,FUT_STOP,FUT_TP1,FUT_TP2,FUT_TP3=range(60,66)
 async def futures_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
     if not await BOT.has_access(update.effective_user.id): await deny_unapproved(update,context); return
+    # Reopening /futures abandons and cleans any unfinished wizard session.
+    previous=context.user_data.pop("fut",None)
+    if previous:
+        for message in list(previous.get("cleanup",[]))+list(previous.get("retry_cleanup",[])):
+            try: await message.delete()
+            except Exception: pass
+        if previous.get("source_message_id"):
+            try: await context.bot.delete_message(update.effective_chat.id,int(previous["source_message_id"]))
+            except Exception: pass
     kb=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Futures Trade",callback_data="futadd")],[InlineKeyboardButton("📋 Manage Trades",callback_data="futlist")]])
     await update.effective_message.reply_text("Futures Trade Manager\n\nAdd a virtual futures position, then receive SL and TP1–TP3 notifications from Binance live price plus closed 1-minute candle data. No real order is placed.",reply_markup=kb)
 
 async def futures_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q=update.callback_query; await q.answer()
+    previous=context.user_data.pop("fut",None)
+    if previous:
+        for message in list(previous.get("cleanup",[]))+list(previous.get("retry_cleanup",[])):
+            try: await message.delete()
+            except Exception: pass
+        if previous.get("source_message_id"):
+            try: await context.bot.delete_message(update.effective_chat.id,int(previous["source_message_id"]))
+            except Exception: pass
     prompt=await q.message.reply_text("Step 1/6 — Futures position screenshot পাঠান, অথবা coin symbol লিখুন।\n\nScreenshot দিলে Coin, Long/Short, Entry, Stop Loss ও TP1 স্বয়ংক্রিয়ভাবে পড়ে নেওয়া হবে।\nManual example: BTC or ETHUSDT\n\n/cancel to stop.")
     # Keep the opening instruction with the wizard's temporary messages; it is
     # removed 30 seconds after a screenshot trade is successfully added.
-    context.user_data["fut"]={"cleanup":[prompt]}
+    context.user_data["fut"]={"cleanup":[prompt],"retry_cleanup":[]}
     return FUT_SYMBOL
 
 async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int:
@@ -1876,17 +1896,25 @@ async def futures_symbol(update: Update,context: ContextTypes.DEFAULT_TYPE)->int
             symbol=BOT._normalize_symbol(str(data["symbol"])); entry=float(data["entry"]); stop=float(data["stop"]); target=float(data["target1"]); direction=str(data["direction"]).lower()
             valid=(direction=="long" and stop<entry<target) or (direction=="short" and target<entry<stop)
             if min(entry,stop,target)<=0 or not valid: raise UserInputError("Screenshot-এর Entry/SL/TP সম্পর্ক সঠিকভাবে যাচাই করা যায়নি।")
+            # A correct screenshot instantly removes all earlier failed images
+            # and their error replies from this wizard session.
+            for temporary in context.user_data["fut"].get("retry_cleanup",[]):
+                try: await temporary.delete()
+                except Exception: pass
+            context.user_data["fut"]["retry_cleanup"]=[]
             context.user_data["fut"].update({"symbol":symbol,"direction":direction,"entry":entry,"stop":stop,"target":target,"source_message_id":message.message_id})
-            detected=await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
-            # Schedule this independently so it is always removed even if the
-            # remaining wizard steps take longer or the conversation restarts.
+            detected=await message.reply_text(f"✅ Screenshot detected\n{symbol} • {direction.upper()}\nEntry: {entry:g}\nStop Loss: {stop:g}\nTarget 1: {target:g}\n\nStep 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।\nTP2 ও TP3 দুটোই skip করতে <code>--</code> পাঠান।",parse_mode=ParseMode.HTML)
+            context.user_data["fut"]["cleanup"].append(detected)
+            # Independent timer guarantees cleanup even if the wizard stalls.
             asyncio.create_task(delete_message_after(detected,30))
             return FUT_TP2
         except UserInputError as exc:
-            await message.reply_text(f"⚠️ {exc}\nআরেকটি পরিষ্কার screenshot পাঠান অথবা coin symbol লিখে manual setup করুন।"); return FUT_SYMBOL
+            error=await message.reply_text(f"⚠️ {exc}\nআরেকটি পরিষ্কার screenshot পাঠান অথবা coin symbol লিখে manual setup করুন।")
+            context.user_data["fut"].setdefault("retry_cleanup",[]).extend([message,error]); return FUT_SYMBOL
         except Exception:
             log.exception("Futures screenshot extraction failed")
-            await message.reply_text("⚠️ Screenshot পড়া যায়নি। পরিষ্কার screenshot আবার পাঠান অথবা coin symbol লিখুন।"); return FUT_SYMBOL
+            error=await message.reply_text("⚠️ Screenshot পড়া যায়নি। পরিষ্কার screenshot আবার পাঠান অথবা coin symbol লিখুন।")
+            context.user_data["fut"].setdefault("retry_cleanup",[]).extend([message,error]); return FUT_SYMBOL
     try: context.user_data["fut"]["symbol"]=BOT._normalize_symbol(message.text or "")
     except UserInputError as exc: await message.reply_text(f"⚠️ {exc}"); return FUT_SYMBOL
     await message.reply_text("Step 2/6 — Entry price লিখুন।"); return FUT_ENTRY
@@ -1907,11 +1935,15 @@ async def futures_number_step(update: Update,context: ContextTypes.DEFAULT_TYPE,
 async def futures_entry(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"entry",FUT_STOP,"Step 3/6 — Stop Loss লিখুন।")
 async def futures_stop(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"stop",FUT_TP1,"Step 4/6 — Target 1 লিখুন।")
 async def futures_tp1(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"target",FUT_TP2,"Step 5/6 — Target 2 লিখুন, না থাকলে - পাঠান।")
-async def futures_tp2(update:Update,context:ContextTypes.DEFAULT_TYPE)->int: return await futures_number_step(update,context,"target2",FUT_TP3,"Step 6/6 — Target 3 লিখুন, না থাকলে - পাঠান।",True)
+async def futures_tp2(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
+    if update.effective_message.text.strip()=="--":
+        context.user_data["fut"]["target2"]=None
+        return await futures_tp3(update,context)
+    return await futures_number_step(update,context,"target2",FUT_TP3,"Step 6/6 — Target 3 লিখুন, না থাকলে - পাঠান।",True)
 
 async def futures_tp3(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
     raw=update.effective_message.text.strip(); d=context.user_data["fut"]
-    try: d["target3"]=None if raw in {"-","skip","0"} else float(raw.replace(",","")); assert d["target3"] is None or d["target3"]>0
+    try: d["target3"]=None if raw in {"-","--","skip","0"} else float(raw.replace(",","")); assert d["target3"] is None or d["target3"]>0
     except Exception: await update.effective_message.reply_text("Positive number দিন অথবা - পাঠান।"); return FUT_TP3
     entry,stop,tp1=d["entry"],d["stop"],d["target"]
     direction="long" if stop<entry<tp1 else "short" if tp1<entry<stop else None
@@ -1934,7 +1966,16 @@ async def futures_tp3(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
     context.user_data.pop("fut",None); return ConversationHandler.END
 
 async def futures_cancel(update:Update,context:ContextTypes.DEFAULT_TYPE)->int:
-    context.user_data.pop("fut",None); await update.effective_message.reply_text("Cancelled."); return ConversationHandler.END
+    d=context.user_data.pop("fut",{})
+    temporary=list(d.get("cleanup",[]))+list(d.get("retry_cleanup",[]))+[update.effective_message]
+    if d.get("source_message_id"):
+        try: await context.bot.delete_message(update.effective_chat.id,int(d["source_message_id"]))
+        except Exception: pass
+    for message in temporary:
+        try: await message.delete()
+        except Exception: pass
+    # No separate “Cancelled” message: cancelling leaves the chat clean.
+    return ConversationHandler.END
 
 async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert BOT is not None
@@ -2277,8 +2318,17 @@ async def trade_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             for number,target,already in targets:
                 if target is None or already: continue
                 hit=(high>=target) if long else (low<=target)
+                # 0.25% early-warning buffer: e.g. long TP 83,000 alerts
+                # near 82,792.5 (approximately 82,800) before the actual target.
+                pre_target=float(target)*(.9975 if long else 1.0025)
+                pre_hit=(high>=pre_target) if long else (low<=pre_target)
+                pre_column=f"pre_tp{number}_hit"
+                if pre_hit and not hit and not r[pre_column]:
+                    await BOT.db.execute(f"UPDATE paper_trades SET {pre_column}=TRUE WHERE id=$1",r['id'])
+                    notice=await context.bot.send_message(r['chat_id'],f"🔔 Futures Trade #{r['display_no']} — TP{number} APPROACHING\n{r['symbol']} • {r['direction'].upper()}\nEarly level: {pre_target:g}\nActual target: {target:g} | Live: {live:g}\n\nTarget is approximately 0.25% away.")
+                    await BOT.db.execute("INSERT INTO paper_trade_messages(trade_id,chat_id,message_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",r['id'],r['chat_id'],notice.message_id)
                 if hit:
-                    await BOT.db.execute(f"UPDATE paper_trades SET tp{number}_hit=TRUE WHERE id=$1",r['id'])
+                    await BOT.db.execute(f"UPDATE paper_trades SET tp{number}_hit=TRUE,{pre_column}=TRUE WHERE id=$1",r['id'])
                     notice=await context.bot.send_message(r['chat_id'],f"🎯 Futures Trade #{r['display_no']} — TP{number} HIT\n{r['symbol']} • {r['direction'].upper()}\nTarget: {target:g} | Live: {live:g}\nSource: Binance live + closed 1m candle")
                     await BOT.db.execute("INSERT INTO paper_trade_messages(trade_id,chat_id,message_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",r['id'],r['chat_id'],notice.message_id)
             last_number=3 if r['target3'] is not None else 2 if r['target2'] is not None else 1
