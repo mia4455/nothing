@@ -1195,8 +1195,8 @@ def _card_font(size: int,bold: bool=False) -> Any:
 
 def make_price_card(symbol: str,name: str,price: float,change: float,candles: list[list[Any]]) -> io.BytesIO:
     """Render a reference-inspired price card entirely in memory."""
-    # Wide Telegram-preview ratio: the full card stays readable without opening it.
-    w,h=1600,480; up=change>=0; accent=(0,255,20) if up else (255,38,42)
+    # Telegram mobile previews preserve this ~2.28:1 ratio without center-cropping.
+    w,h=1600,700; up=change>=0; accent=(0,255,20) if up else (255,38,42)
     # Use the clean reference-derived neon background shipped with the project.
     # Fall back safely if an incomplete deployment omits the asset.
     root=os.path.dirname(os.path.abspath(__file__))
@@ -1215,25 +1215,25 @@ def make_price_card(symbol: str,name: str,price: float,change: float,candles: li
         log.warning("Price-card background unavailable (%s); using dark fallback",exc)
         img=Image.new("RGB",(w,h),(3,7,28))
     d=ImageDraw.Draw(img,"RGBA")
-    # Compact title and five candles leave a centered, unobstructed price.
-    base=symbol.split('/')[0]; d.ellipse((35,24,125,114),fill=(210,145,28,255),outline=(255,220,110,255),width=4)
-    badge=base[:3]; badge_font=_card_font(23,True); bb=d.textbbox((0,0),badge,font=badge_font)
-    d.text((80-(bb[2]-bb[0])/2,69-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
-    d.text((145,35),f"{name.upper()} ({base})",font=_card_font(43,True),fill="white",stroke_width=1,stroke_fill="white")
+    # Keep important content inside Telegram's rounded-corner safe area.
+    base=symbol.split('/')[0]; d.ellipse((48,38,148,138),fill=(210,145,28,255),outline=(255,220,110,255),width=4)
+    badge=base[:3]; badge_font=_card_font(25,True); bb=d.textbbox((0,0),badge,font=badge_font)
+    d.text((98-(bb[2]-bb[0])/2,88-(bb[3]-bb[1])/2),badge,font=badge_font,fill="white",stroke_width=1,stroke_fill="white")
+    d.text((170,50),f"{name.upper()} ({base})",font=_card_font(48,True),fill="white",stroke_width=1,stroke_fill="white")
     price_text=f"${price:.8f}".rstrip("0").rstrip(".")
     if price>=100: price_text=f"${price:.2f}"
-    price_font=_card_font(120,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
-    # Center around x=720, safely left of the candle panel.
-    price_x=720-(pb[2]-pb[0])/2
-    d.text((price_x,142),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
-    brand_font=_card_font(34,False); wb=d.textbbox((0,0),PRICE_CARD_BRAND,font=brand_font)
-    d.text((720-(wb[2]-wb[0])/2,320),PRICE_CARD_BRAND,font=brand_font,fill=(235,235,240))
-    # Five real 15-minute candles remain fully visible in Telegram's chat preview.
-    chart=(1160,35,1545,440); x0,y0,x1,y1=chart
+    price_font=_card_font(140,True); pb=d.textbbox((0,0),price_text,font=price_font,stroke_width=2)
+    # True image-centred price. The five-candle panel starts immediately after it.
+    price_x=800-(pb[2]-pb[0])/2
+    d.text((price_x,205),price_text,font=price_font,fill=accent,stroke_width=2,stroke_fill=accent)
+    brand_font=_card_font(38,False); wb=d.textbbox((0,0),PRICE_CARD_BRAND,font=brand_font)
+    d.text((800-(wb[2]-wb[0])/2,390),PRICE_CARD_BRAND,font=brand_font,fill=(235,235,240))
+    # Five tightly spaced real 15-minute candles on the right.
+    chart=(1170,65,1545,635); x0,y0,x1,y1=chart
     last=candles[-5:]; highs=[float(c[2]) for c in last]; lows=[float(c[3]) for c in last]
     lo,hi=min(lows),max(highs); span=max(hi-lo,price*.0001)
     scale=lambda v: y1-(float(v)-lo)/span*(y1-y0)
-    step=(x1-x0)/max(1,len(last)); body=max(16,int(step*.48))
+    step=(x1-x0)/max(1,len(last)); body=max(18,int(step*.78))
     for i,c in enumerate(last):
         o,high,low,close=map(float,c[1:5]); cx=x0+step*(i+.5); color=(0,245,45,255) if close>=o else (255,45,48,255)
         d.line((cx,scale(high),cx,scale(low)),fill=color,width=5)
@@ -1271,13 +1271,15 @@ async def price_alert_off_command(update: Update,context: ContextTypes.DEFAULT_T
 def price_alert_list_ui(rows: list[Any]) -> tuple[str,InlineKeyboardMarkup | None]:
     if not rows: return "কোনো channel price alert নেই।",None
     lines=["Channel Price Alerts","Button চাপলে একই list-এ ON/OFF পরিবর্তন হবে।"]
-    buttons=[]
+    flat_buttons=[]
     for r in rows:
         status="ON" if r['enabled'] else "OFF"
-        lines.append(f"\n{r['symbol']} — {r['interval_minutes']}m — {status}")
+        lines.append(f"{r['symbol']} — {r['interval_minutes']}m — {status}")
         # Button shows the action that will happen when pressed.
         action="OFF" if r['enabled'] else "ON"
-        buttons.append([InlineKeyboardButton(f"{r['symbol']}  •  Turn {action}",callback_data=f"patoggle|{r['id']}")])
+        flat_buttons.append(InlineKeyboardButton(f"{r['symbol']} • Turn {action}",callback_data=f"patoggle|{r['id']}"))
+    # Two compact controls per row remove the large vertical gap.
+    buttons=[flat_buttons[i:i+2] for i in range(0,len(flat_buttons),2)]
     return "\n".join(lines),InlineKeyboardMarkup(buttons)
 
 
